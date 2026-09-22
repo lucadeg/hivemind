@@ -1,9 +1,9 @@
+
 name: PR Checks
 
 on:
-  pull_request:
-    types: [opened, edited, synchronize, reopened]
-
+  workflow_dispatch:
+  # Automatic triggers removed; invoke through FounderOS/Admin Gate.
 jobs:
   # Version bump is handled automatically by release.yml on push to main.
   # Add future PR checks here.
