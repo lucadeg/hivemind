@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { setFakeHome, clearFakeHome } from "../shared/fake-home.js";
 
 /**
  * Tests for the disk-side of src/cli/install-cursor.ts.
@@ -21,21 +22,21 @@ beforeEach(() => {
   tmpHome = join(tmpRoot, "home");
   tmpPkg = join(tmpRoot, "pkg");
   mkdirSync(join(tmpHome, ".cursor"), { recursive: true });
-  mkdirSync(join(tmpPkg, "cursor", "bundle"), { recursive: true });
-  writeFileSync(join(tmpPkg, "cursor", "bundle", "session-start.js"), "// fake bundle");
-  writeFileSync(join(tmpPkg, "cursor", "bundle", "capture.js"), "// fake bundle");
-  writeFileSync(join(tmpPkg, "cursor", "bundle", "pre-tool-use.js"), "// fake bundle");
-  writeFileSync(join(tmpPkg, "cursor", "bundle", "session-end.js"), "// fake bundle");
+  mkdirSync(join(tmpPkg, "harnesses", "cursor", "bundle"), { recursive: true });
+  writeFileSync(join(tmpPkg, "harnesses", "cursor", "bundle", "session-start.js"), "// fake bundle");
+  writeFileSync(join(tmpPkg, "harnesses", "cursor", "bundle", "capture.js"), "// fake bundle");
+  writeFileSync(join(tmpPkg, "harnesses", "cursor", "bundle", "pre-tool-use.js"), "// fake bundle");
+  writeFileSync(join(tmpPkg, "harnesses", "cursor", "bundle", "session-end.js"), "// fake bundle");
   writeFileSync(join(tmpPkg, "package.json"), JSON.stringify({ version: "9.9.9" }));
 
-  vi.stubEnv("HOME", tmpHome);
+  setFakeHome(tmpHome);
   vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 });
 
 afterEach(() => {
   rmSync(tmpRoot, { recursive: true, force: true });
-  vi.unstubAllEnvs();
+  clearFakeHome();
   vi.restoreAllMocks();
   vi.resetModules();
 });
@@ -112,9 +113,44 @@ describe("installCursor", () => {
   });
 
   it("throws when the bundle source is missing (build hasn't run)", async () => {
-    rmSync(join(tmpPkg, "cursor", "bundle"), { recursive: true, force: true });
+    rmSync(join(tmpPkg, "harnesses", "cursor", "bundle"), { recursive: true, force: true });
     const { installCursor } = await importInstaller();
     expect(() => installCursor()).toThrow(/Cursor bundle missing/);
+  });
+
+  it("creates embed-deps symlink when ~/.hivemind/embed-deps/node_modules exists", async () => {
+    const embedDepsNm = join(tmpHome, ".hivemind", "embed-deps", "node_modules");
+    mkdirSync(embedDepsNm, { recursive: true });
+
+    const { installCursor } = await importInstaller();
+    installCursor();
+
+    const pluginNm = join(tmpHome, ".cursor", "hivemind", "node_modules");
+    const { lstatSync } = await import("node:fs");
+    expect(lstatSync(pluginNm).isSymbolicLink()).toBe(true);
+  });
+
+  it("replaces an existing real directory at pluginNm with a symlink when embed-deps present", async () => {
+    const embedDepsNm = join(tmpHome, ".hivemind", "embed-deps", "node_modules");
+    mkdirSync(embedDepsNm, { recursive: true });
+    // Pre-create a real directory where the symlink should go
+    const pluginNm = join(tmpHome, ".cursor", "hivemind", "node_modules");
+    mkdirSync(pluginNm, { recursive: true });
+
+    const { installCursor } = await importInstaller();
+    installCursor();
+
+    const { lstatSync } = await import("node:fs");
+    expect(lstatSync(pluginNm).isSymbolicLink()).toBe(true);
+  });
+
+  it("skips embed-deps symlink when ~/.hivemind/embed-deps/node_modules is absent", async () => {
+    const { installCursor } = await importInstaller();
+    installCursor();
+
+    const pluginNm = join(tmpHome, ".cursor", "hivemind", "node_modules");
+    // No symlink should exist — embed-deps dir was never created
+    expect(existsSync(pluginNm)).toBe(false);
   });
 });
 

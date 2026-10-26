@@ -25,9 +25,11 @@
  * exactly equivalent to `hivemind skillify pull --all-users --to global`.
  */
 
-import { loadConfig, type Config } from "../config.js";
+import { type Config } from "../config.js";
+import { loadRoutedConfig } from "../dir-config.js";
 import { DeeplakeApi } from "../deeplake-api.js";
 import { runPull, type QueryFn } from "./pull.js";
+import { migrateLegacyCappedInstalls } from "./legacy-cap-migration.js";
 import { log as _log } from "../utils/debug.js";
 
 const log = (msg: string) => _log("skillify-autopull", msg);
@@ -79,9 +81,23 @@ export async function autoPullSkills(deps: AutoPullDeps = {}): Promise<AutoPullR
     return { pulled: 0, skipped: true, reason: "disabled" };
   }
 
+  // Local, remote-independent cap migration of legacy over-long installs.
+  // Runs BEFORE the network query — and before the config / not-logged-in
+  // check — so a legacy managed install whose org/workspace isn't the
+  // currently-routed one (or an offline session) still gets its frontmatter
+  // `name` capped, instead of codex logging "invalid name: exceeds maximum
+  // length of 64 characters" for it forever. All failures are swallowed
+  // inside the pass; never let it block SessionStart.
+  try { migrateLegacyCappedInstalls(); }
+  catch (e: any) { log(`legacy-cap migration failed (swallowed): ${e?.message ?? e}`); }
+
   // Not logged in → silent skip (no nag).
-  const loadFn = deps.loadConfigFn ?? loadConfig;
-  const config = loadFn();
+  // Real callers get the routed config (nearest `.hivemind` for the session
+  // cwd); tests inject their own loadConfigFn. No inline default fn so the
+  // real path stays a plain call, not an extra uncovered closure.
+  const config = deps.loadConfigFn
+    ? deps.loadConfigFn()
+    : loadRoutedConfig(deps.cwd ?? process.cwd());
   if (!config) {
     log("skipped: not logged in");
     return { pulled: 0, skipped: true, reason: "not-logged-in" };
@@ -89,6 +105,14 @@ export async function autoPullSkills(deps: AutoPullDeps = {}): Promise<AutoPullR
 
   // Build the query function. Tests inject one; real callers get the API client.
   let query: QueryFn;
+  // Deferred table-existence discovery — resolved INSIDE the timeout budget
+  // below, NOT here, so a slow `GET /tables` can't make SessionStart block
+  // past timeoutMs. Resolves to a predicate that lets runPull skip the SELECT
+  // (and the server-side 42P01) when `skills` doesn't exist yet on a fresh
+  // workspace, or undefined when the list can't be fetched / a test injects
+  // its own query (runPull then falls back to its isMissingTableError catch).
+  let discoverTableExists: () => Promise<((name: string) => boolean) | undefined> =
+    async () => undefined;
   if (deps.queryFn) {
     query = deps.queryFn;
   } else {
@@ -100,6 +124,10 @@ export async function autoPullSkills(deps: AutoPullDeps = {}): Promise<AutoPullR
       config.skillsTableName,
     );
     query = (sql: string) => api.query(sql) as Promise<Record<string, unknown>[]>;
+    discoverTableExists = async () => {
+      const known = await api.knownTablesOrNull();
+      return known ? (name: string) => known.includes(name) : undefined;
+    };
   }
 
   const install = deps.install ?? "global";
@@ -107,15 +135,23 @@ export async function autoPullSkills(deps: AutoPullDeps = {}): Promise<AutoPullR
 
   try {
     const summary = await withTimeout(
-      runPull({
-        query,
-        tableName: config.skillsTableName,
-        install,
-        cwd: install === "project" ? (deps.cwd ?? process.cwd()) : undefined,
-        users: [],
-        dryRun: false,
-        force: false,
-      }),
+      // Table discovery + pull share one budget: if `GET /tables` hangs the
+      // whole thing times out and we degrade, instead of blocking startup.
+      (async () => {
+        const tableExists = await discoverTableExists();
+        return runPull({
+          query,
+          tableName: config.skillsTableName,
+          install,
+          cwd: install === "project" ? (deps.cwd ?? process.cwd()) : undefined,
+          projectCwd: deps.cwd ?? process.cwd(),
+          selfAuthor: config.userName,
+          users: [],
+          dryRun: false,
+          force: false,
+          tableExists,
+        });
+      })(),
       timeoutMs,
     );
     log(`pulled scanned=${summary.scanned} wrote=${summary.wrote} skipped=${summary.skipped}`);

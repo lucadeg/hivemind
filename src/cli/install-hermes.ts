@@ -1,7 +1,7 @@
-import { existsSync, writeFileSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, writeFileSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import * as yaml from "js-yaml";
-import { HOME, pkgRoot, ensureDir, copyDir, writeVersionStamp, log } from "./util.js";
+import { HOME, pkgRoot, ensureDir, syncDir, pruneDir, reportPruned, symlinkForce, isLink, writeVersionStamp, log, warn } from "./util.js";
 import { getVersion } from "./version.js";
 import { ensureMcpServerInstalled, MCP_SERVER_PATH } from "./install-mcp-shared.js";
 
@@ -30,7 +30,8 @@ import { ensureMcpServerInstalled, MCP_SERVER_PATH } from "./install-mcp-shared.
 //   - https://hermes-agent.nousresearch.com/docs/user-guide/features/hooks
 
 const HERMES_HOME = join(HOME, ".hermes");
-const SKILLS_DIR = join(HERMES_HOME, "skills", "hivemind-memory");
+const SKILLS_ROOT = join(HERMES_HOME, "skills");
+const SKILLS_DIR = join(SKILLS_ROOT, "hivemind-memory");
 const HIVEMIND_DIR = join(HERMES_HOME, "hivemind");
 const BUNDLE_DIR = join(HIVEMIND_DIR, "bundle");
 const CONFIG_PATH = join(HERMES_HOME, "config.yaml");
@@ -101,7 +102,13 @@ interface HermesConfig {
 function isHivemindHook(entry: unknown): boolean {
   if (!entry || typeof entry !== "object") return false;
   const cmd = (entry as { command?: string }).command;
-  return typeof cmd === "string" && cmd.includes("/.hermes/hivemind/bundle/");
+  if (typeof cmd !== "string") return false;
+  // Normalize separators: on Windows the command is written with backslashes
+  // (`...\.hermes\hivemind\bundle\capture.js` — buildHookEntry uses join()), so
+  // a forward-slash-only match would fail and re-install would duplicate the
+  // hooks (same Windows bug fixed in codex's isHivemindHookEntry / cursor's
+  // isHivemindEntry).
+  return cmd.replace(/\\/g, "/").includes("/.hermes/hivemind/bundle/");
 }
 
 function buildHookEntry(bundleFile: string, timeout: number, matcher?: string): HermesHookEntry {
@@ -125,7 +132,10 @@ function buildHooksBlock(): Record<string, HermesHookEntry[]> {
     pre_llm_call: [buildHookEntry("capture.js", 10)],
     post_tool_call: [buildHookEntry("capture.js", 15)],
     post_llm_call: [buildHookEntry("capture.js", 15)],
-    on_session_end: [buildHookEntry("session-end.js", 30)],
+    // graph-on-stop: code-graph auto-build parity (G3), same gated hook as the
+    // other agents. on_session_end is Hermes's session-close event (analogous
+    // to Claude Code's SessionEnd).
+    on_session_end: [buildHookEntry("session-end.js", 30), buildHookEntry("graph-on-stop.js", 30)],
   };
 }
 
@@ -172,20 +182,54 @@ function writeConfig(cfg: HermesConfig): void {
   writeFileSync(CONFIG_PATH, dumped);
 }
 
+// Skills shipped as files under harnesses/hermes/skills/<name>/ (goals, graph).
+// Hermes loads them from ~/.hermes/skills/<name>/ next to hivemind-memory;
+// each dir is synced whole so a skill dropped from the package disappears
+// on the next install instead of lingering with instructions for commands
+// that no longer exist.
+function packagedSkillsSrc(): string {
+  return join(pkgRoot(), "harnesses", "hermes", "skills");
+}
+
+function packagedSkillNames(): string[] {
+  const src = packagedSkillsSrc();
+  if (!existsSync(src)) return [];
+  return readdirSync(src, { withFileTypes: true })
+    .filter(e => e.isDirectory())
+    .map(e => e.name);
+}
+
 export function installHermes(): void {
-  // 1. Skill — agent context.
-  ensureDir(SKILLS_DIR);
-  writeFileSync(join(SKILLS_DIR, "SKILL.md"), SKILL_BODY);
-  writeVersionStamp(SKILLS_DIR, getVersion());
-  log(`  Hermes         skill installed -> ${SKILLS_DIR}`);
+  // 1. Skills — agent context. hivemind-memory is written inline; everything
+  //    else the installer ever put in that dir (an older version's
+  //    templates/) is pruned so only the current skill body remains.
+  if (isLink(SKILLS_DIR)) {
+    warn(`  Hermes         skipping ${SKILLS_DIR}: it is a symlink, not a hivemind-owned directory`);
+  } else {
+    ensureDir(SKILLS_DIR);
+    writeFileSync(join(SKILLS_DIR, "SKILL.md"), SKILL_BODY);
+    writeVersionStamp(SKILLS_DIR, getVersion());
+    reportPruned("Hermes", pruneDir(SKILLS_DIR, ["SKILL.md", ".hivemind_version"]));
+    log(`  Hermes         skill installed -> ${SKILLS_DIR}`);
+  }
+  for (const name of packagedSkillNames()) {
+    reportPruned("Hermes", syncDir(join(packagedSkillsSrc(), name), join(SKILLS_ROOT, name)));
+    log(`  Hermes         skill installed -> ${join(SKILLS_ROOT, name)}`);
+  }
 
   // 2. Hook bundle — auto-capture via Hermes shell-hooks.
-  const srcBundle = join(pkgRoot(), "hermes", "bundle");
+  const srcBundle = join(pkgRoot(), "harnesses", "hermes", "bundle");
   if (!existsSync(srcBundle)) {
     throw new Error(`Hermes bundle missing at ${srcBundle}. Run 'npm run build' first.`);
   }
   ensureDir(HIVEMIND_DIR);
-  copyDir(srcBundle, BUNDLE_DIR);
+  reportPruned("Hermes", syncDir(srcBundle, BUNDLE_DIR));
+  const pluginNm = join(HIVEMIND_DIR, "node_modules");
+  const embedDepsNm = join(HOME, ".hivemind", "embed-deps", "node_modules");
+  if (existsSync(embedDepsNm)) {
+    try { const st = lstatSync(pluginNm); if (st.isDirectory() && !st.isSymbolicLink()) rmSync(pluginNm, { recursive: true }); } catch { /* ok */ }
+    symlinkForce(embedDepsNm, pluginNm);
+  }
   writeVersionStamp(HIVEMIND_DIR, getVersion());
   log(`  Hermes         bundle installed -> ${BUNDLE_DIR}`);
 
@@ -209,9 +253,11 @@ export function installHermes(): void {
 }
 
 export function uninstallHermes(): void {
-  if (existsSync(SKILLS_DIR)) {
-    rmSync(SKILLS_DIR, { recursive: true, force: true });
-    log(`  Hermes         removed ${SKILLS_DIR}`);
+  for (const dir of [SKILLS_DIR, ...packagedSkillNames().map(n => join(SKILLS_ROOT, n))]) {
+    // A symlink at one of our names is the user's, never something we wrote.
+    if (!existsSync(dir) || isLink(dir)) continue;
+    rmSync(dir, { recursive: true, force: true });
+    log(`  Hermes         removed ${dir}`);
   }
 
   if (existsSync(HIVEMIND_DIR)) {

@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /**
  * Source-level tests for src/hooks/session-start-setup.ts. This hook
@@ -18,6 +21,7 @@ const ensureTableMock = vi.fn();
 const ensureSessionsTableMock = vi.fn();
 const autoUpdateMock = vi.fn();
 const embedWarmupMock = vi.fn();
+const spawnDetachedMock = vi.fn();
 
 vi.mock("../../src/utils/stdin.js", () => ({ readStdin: (...a: any[]) => stdinMock(...a) }));
 vi.mock("../../src/commands/auth.js", () => ({
@@ -38,6 +42,13 @@ vi.mock("../../src/deeplake-api.js", () => ({
 vi.mock("../../src/hooks/shared/autoupdate.js", () => ({
   autoUpdate: (...a: any[]) => autoUpdateMock(...a),
 }));
+// The hook no longer provisions graph-deps inline: a cold npm install +
+// native compile can exceed the ~120s hook timeout, so it spawns a DETACHED
+// worker via spawnDetachedNodeWorker. Mock that boundary and assert the hook
+// spawns graph-deps-worker.js (and BEFORE the credentials gate).
+vi.mock("../../src/utils/spawn-detached.js", () => ({
+  spawnDetachedNodeWorker: (...a: any[]) => spawnDetachedMock(...a),
+}));
 vi.mock("../../src/embeddings/client.js", () => ({
   EmbedClient: class {
     async warmup() { return embedWarmupMock(); }
@@ -48,21 +59,38 @@ vi.mock("../../src/embeddings/client.js", () => ({
 // (it's installed once into ~/.hivemind/embed-deps via `hivemind embeddings
 // install`). Without this mock the warmup branch is never reached and every
 // assertion below would land on the "skipped: no-transformers" log line. We
-// still respect HIVEMIND_EMBEDDINGS=false so the master-flag branch test below
-// behaves like production.
+// still honor the EMBEDDINGS_DISABLED_FOR_TEST env so the master-flag branch
+// test below behaves like the production user-disabled path.
 vi.mock("../../src/embeddings/disable.js", () => ({
-  embeddingsDisabled: () => process.env.HIVEMIND_EMBEDDINGS === "false",
+  embeddingsDisabled: () => process.env.EMBEDDINGS_DISABLED_FOR_TEST === "1",
   embeddingsStatus: () =>
-    process.env.HIVEMIND_EMBEDDINGS === "false" ? "disabled-by-env" : "enabled",
+    process.env.EMBEDDINGS_DISABLED_FOR_TEST === "1" ? "user-disabled" : "enabled",
 }));
 
 // We also need to control global.fetch for the GitHub version lookup.
 const originalFetch = global.fetch;
 const fetchMock = vi.fn();
 
+// Env keys touched by tests in this file. Recorded so afterEach() can
+// restore them — without this, a test that sets e.g.
+// EMBEDDINGS_DISABLED_FOR_TEST=1 would leak the disabled state into
+// every later test in the same vitest worker (next runHook() call without
+// that key wouldn't clear it, since runHook() only updates the keys
+// passed in). That's exactly the order-dependence CodeRabbit flagged.
+const TOUCHED_ENV_KEYS = [
+  "HIVEMIND_WIKI_WORKER",
+  "HIVEMIND_EMBED_WARMUP",
+  "EMBEDDINGS_DISABLED_FOR_TEST",
+] as const;
+const _origEnv: Record<string, string | undefined> = {};
+
 async function runHook(env: Record<string, string | undefined> = {}): Promise<void> {
+  for (const k of TOUCHED_ENV_KEYS) {
+    if (!(k in _origEnv)) _origEnv[k] = process.env[k];
+  }
   delete process.env.HIVEMIND_WIKI_WORKER;
   for (const [k, v] of Object.entries(env)) {
+    if (!(k in _origEnv)) _origEnv[k] = process.env[k];
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
@@ -91,6 +119,7 @@ beforeEach(() => {
   ensureSessionsTableMock.mockReset().mockResolvedValue(undefined);
   autoUpdateMock.mockReset().mockResolvedValue(undefined);
   embedWarmupMock.mockReset().mockResolvedValue(true);
+  spawnDetachedMock.mockReset();
   fetchMock.mockReset().mockResolvedValue({
     ok: true,
     json: async () => ({ version: "0.0.1" }),
@@ -100,6 +129,14 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   global.fetch = originalFetch;
+  // Restore env keys the tests may have mutated via runHook(), so later
+  // tests in this file (and other test files in the same worker) start
+  // from a clean process.env.
+  for (const [k, v] of Object.entries(_origEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  for (const k of Object.keys(_origEnv)) delete _origEnv[k];
 });
 
 describe("session-start-setup hook — guards", () => {
@@ -119,6 +156,44 @@ describe("session-start-setup hook — guards", () => {
     loadCredsMock.mockReturnValue({ token: "", userName: "alice" });
     await runHook();
     expect(debugLogMock).toHaveBeenCalledWith("no credentials");
+  });
+});
+
+describe("session-start-setup hook — graph-deps provisioning (detached worker)", () => {
+  const spawnedGraphDeps = () =>
+    spawnDetachedMock.mock.calls.find(([p]) => typeof p === "string" && p.endsWith("graph-deps-worker.js"));
+
+  it("spawns the graph-deps worker detached once on the happy path (NOT inline)", async () => {
+    await runHook();
+    expect(spawnedGraphDeps()).toBeDefined();
+  });
+
+  it("spawns graph-deps even when there are NO credentials (local, login-independent)", async () => {
+    loadCredsMock.mockReturnValue(null);
+    await runHook();
+    // The worker spawn must fire BEFORE the credentials early-return.
+    expect(spawnedGraphDeps()).toBeDefined();
+    expect(debugLogMock).toHaveBeenCalledWith("no credentials");
+  });
+
+  it("spawns the graph-deps worker BEFORE loadCredentials (ordering)", async () => {
+    let graphAt = -1;
+    let credsAt = -1;
+    let counter = 0;
+    spawnDetachedMock.mockImplementation((p: string) => { if (p.endsWith("graph-deps-worker.js")) graphAt = counter++; });
+    loadCredsMock.mockImplementation(() => { credsAt = counter++; return { token: "tok", userName: "alice" }; });
+    await runHook();
+    expect(graphAt).toBeGreaterThanOrEqual(0);
+    expect(credsAt).toBeGreaterThanOrEqual(0);
+    expect(graphAt).toBeLessThan(credsAt);
+  });
+
+  it("the detached spawn does not block the rest of the hook (table setup still runs)", async () => {
+    // spawnDetachedNodeWorker is fire-and-forget: the hook proceeds to its
+    // credentialed table-setup work without awaiting the worker.
+    await runHook();
+    expect(spawnedGraphDeps()).toBeDefined();
+    expect(ensureTableMock).toHaveBeenCalled();
   });
 });
 
@@ -227,11 +302,11 @@ describe("session-start-setup hook — embed daemon warmup", () => {
     );
   });
 
-  it("skips warmup when the master HIVEMIND_EMBEDDINGS=false flag is set", async () => {
-    await runHook({ HIVEMIND_EMBEDDINGS: "false" });
+  it("skips warmup when the user has disabled embeddings in config", async () => {
+    await runHook({ EMBEDDINGS_DISABLED_FOR_TEST: "1" });
     expect(embedWarmupMock).not.toHaveBeenCalled();
     expect(debugLogMock).toHaveBeenCalledWith(
-      "embed daemon warmup skipped: HIVEMIND_EMBEDDINGS=false",
+      "embed daemon warmup skipped: embeddings disabled in ~/.deeplake/config.json (run `hivemind embeddings enable` to opt in)",
     );
   });
 });
@@ -251,3 +326,24 @@ describe("session-start-setup hook — fatal catch", () => {
 // isNewer comparison — are tested at the layer they belong to:
 // `src/cli/update.ts` and the autoUpdate helper itself, not in the
 // per-agent setup hook.)
+
+describe("session-start-setup hook — .hivemind collect:false", () => {
+  let hmDir = "";
+  afterEach(() => { if (hmDir) rmSync(hmDir, { recursive: true, force: true }); hmDir = ""; });
+
+  it("does nothing in a collect:false tree — no worker spawn, no creds, no table setup", async () => {
+    hmDir = mkdtempSync(join(tmpdir(), "setup-hivemind-"));
+    writeFileSync(join(hmDir, ".hivemind"), JSON.stringify({ collect: false }));
+    stdinMock.mockResolvedValue({ session_id: "sid-1", cwd: hmDir });
+    await runHook();
+    expect(spawnDetachedMock).not.toHaveBeenCalled();
+    expect(loadCredsMock).not.toHaveBeenCalled();
+    expect(ensureTableMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to process.cwd() when stdin has no cwd", async () => {
+    stdinMock.mockResolvedValue({ session_id: "sid-1" });
+    await runHook();
+    expect(spawnDetachedMock).toHaveBeenCalledTimes(1);
+  });
+});

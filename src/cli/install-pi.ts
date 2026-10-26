@@ -1,7 +1,13 @@
 import { existsSync, writeFileSync, rmSync, readFileSync, copyFileSync } from "node:fs";
 import { join } from "node:path";
-import { HOME, pkgRoot, ensureDir, writeVersionStamp, log } from "./util.js";
+import { HOME, pkgRoot, ensureDir, syncDir, reportPruned, writeVersionStamp, log } from "./util.js";
 import { getVersion } from "./version.js";
+import {
+  upsertMarkedBlock,
+  stripMarkedBlock,
+  HIVEMIND_BLOCK_START,
+  HIVEMIND_BLOCK_END,
+} from "./agents-md.js";
 
 // pi (badlogic/pi-mono `packages/coding-agent`) integration — Tier 1.
 //
@@ -32,25 +38,12 @@ const LEGACY_SKILL_DIR = join(PI_AGENT_DIR, "skills", "hivemind-memory");
 const EXTENSIONS_DIR = join(PI_AGENT_DIR, "extensions");
 const EXTENSION_PATH = join(EXTENSIONS_DIR, "hivemind.ts");
 const VERSION_DIR = join(PI_AGENT_DIR, ".hivemind");
-// Pi's session_shutdown handler spawns this bundled wiki-worker (which
-// itself shells `pi --print`) to generate the AI summary + embed it via
-// the canonical daemon. CC/codex/cursor/hermes ship their wiki-worker
-// inside their per-agent bundles; pi has no per-agent bundle so we
-// install it as a separate file alongside.
+// Worker bundles the extension spawns (wiki-worker shells `pi --print` for
+// the AI summary; skillify / autopull / skillopt / notifications workers are
+// the shared modules pi cannot import as raw .ts). CC/codex/cursor/hermes
+// ship these inside their per-agent bundles; pi has no per-agent bundle so
+// they are installed as a sibling dir of the extension.
 const WIKI_WORKER_DIR = join(PI_AGENT_DIR, "hivemind");
-const WIKI_WORKER_PATH = join(WIKI_WORKER_DIR, "wiki-worker.js");
-// Skillify worker bundle, spawned by pi extension on session_shutdown to mine
-// reusable Claude skills from the just-finished session. Sibling of
-// wiki-worker.js so a single ensureDir + cleanup covers both.
-const SKILLIFY_WORKER_PATH = join(WIKI_WORKER_DIR, "skillify-worker.js");
-// Autopull worker bundle, spawned synchronously by pi extension on
-// session_start to fetch all-author skills from the org table. Same
-// shared autoPullSkills() codex/cursor/hermes call directly; pi can't
-// import the TS module so it routes through this child process.
-const AUTOPULL_WORKER_PATH = join(WIKI_WORKER_DIR, "autopull-worker.js");
-
-const HIVEMIND_BLOCK_START = "<!-- BEGIN hivemind-memory -->";
-const HIVEMIND_BLOCK_END = "<!-- END hivemind-memory -->";
 
 const HIVEMIND_BLOCK_BODY = `${HIVEMIND_BLOCK_START}
 ## Hivemind Memory
@@ -71,33 +64,11 @@ rg/ripgrep, node, python, curl are not available there.
 ${HIVEMIND_BLOCK_END}`;
 
 export function upsertHivemindBlock(existing: string | null): string {
-  const block = HIVEMIND_BLOCK_BODY;
-  if (!existing) return `${block}\n`;
-  // Strip any pre-existing hivemind block, then re-append.
-  const startIdx = existing.indexOf(HIVEMIND_BLOCK_START);
-  if (startIdx === -1) return `${existing.trimEnd()}\n\n${block}\n`;
-  const endIdx = existing.indexOf(HIVEMIND_BLOCK_END, startIdx);
-  if (endIdx === -1) {
-    // Malformed prior block — append fresh and let the user clean up.
-    return `${existing.trimEnd()}\n\n${block}\n`;
-  }
-  const before = existing.slice(0, startIdx).trimEnd();
-  const after = existing.slice(endIdx + HIVEMIND_BLOCK_END.length).replace(/^\n+/, "");
-  const rest = after ? `\n\n${after}` : "";
-  return `${before ? before + "\n\n" : ""}${block}\n${rest}`;
+  return upsertMarkedBlock(existing, HIVEMIND_BLOCK_BODY);
 }
 
 export function stripHivemindBlock(existing: string): string {
-  const startIdx = existing.indexOf(HIVEMIND_BLOCK_START);
-  if (startIdx === -1) return existing;
-  const endIdx = existing.indexOf(HIVEMIND_BLOCK_END, startIdx);
-  if (endIdx === -1) return existing;
-  const before = existing.slice(0, startIdx).trimEnd();
-  const after = existing.slice(endIdx + HIVEMIND_BLOCK_END.length).replace(/^\n+/, "");
-  if (!before && !after) return "";
-  if (!before) return after;
-  if (!after) return `${before}\n`;
-  return `${before}\n\n${after}`;
+  return stripMarkedBlock(existing);
 }
 
 export function installPi(): void {
@@ -116,36 +87,20 @@ export function installPi(): void {
   writeFileSync(AGENTS_MD, next);
 
   // 2. Extension — autocapture + first-class hivemind tools.
-  const srcExtension = join(pkgRoot(), "pi", "extension-source", "hivemind.ts");
+  const srcExtension = join(pkgRoot(), "harnesses", "pi", "extension-source", "hivemind.ts");
   if (!existsSync(srcExtension)) {
     throw new Error(`pi extension source missing at ${srcExtension}. Reinstall the @deeplake/hivemind package.`);
   }
   ensureDir(EXTENSIONS_DIR);
   copyFileSync(srcExtension, EXTENSION_PATH);
 
-  // 3. Wiki-worker bundle (spawned by extension at periodic + session_shutdown
-  //    triggers to generate AI summary via `pi --print`).
-  const srcWorker = join(pkgRoot(), "pi", "bundle", "wiki-worker.js");
-  if (existsSync(srcWorker)) {
+  // 3. Worker bundles. The whole dir is synced so a renamed worker from a
+  //    previous version does not linger next to its replacement.
+  const srcWorkers = join(pkgRoot(), "harnesses", "pi", "bundle");
+  const workersInstalled = existsSync(srcWorkers);
+  if (workersInstalled) {
     ensureDir(WIKI_WORKER_DIR);
-    copyFileSync(srcWorker, WIKI_WORKER_PATH);
-  }
-
-  // 4. Skillify-worker bundle (spawned by extension on session_shutdown to
-  //    mine reusable skills from the finished session). Same dir as
-  //    wiki-worker, same shared ensureDir.
-  const srcSkillifyWorker = join(pkgRoot(), "pi", "bundle", "skillify-worker.js");
-  if (existsSync(srcSkillifyWorker)) {
-    ensureDir(WIKI_WORKER_DIR);
-    copyFileSync(srcSkillifyWorker, SKILLIFY_WORKER_PATH);
-  }
-
-  // 5. Autopull-worker bundle (spawned synchronously by extension on
-  //    session_start to pull all-author skills from the org). Same dir.
-  const srcAutopullWorker = join(pkgRoot(), "pi", "bundle", "autopull-worker.js");
-  if (existsSync(srcAutopullWorker)) {
-    ensureDir(WIKI_WORKER_DIR);
-    copyFileSync(srcAutopullWorker, AUTOPULL_WORKER_PATH);
+    reportPruned("pi", syncDir(srcWorkers, WIKI_WORKER_DIR));
   }
 
   ensureDir(VERSION_DIR);
@@ -153,14 +108,8 @@ export function installPi(): void {
 
   log(`  pi             AGENTS.md updated -> ${AGENTS_MD}`);
   log(`  pi             extension installed -> ${EXTENSION_PATH}`);
-  if (existsSync(WIKI_WORKER_PATH)) {
-    log(`  pi             wiki-worker installed -> ${WIKI_WORKER_PATH}`);
-  }
-  if (existsSync(SKILLIFY_WORKER_PATH)) {
-    log(`  pi             skillify-worker installed -> ${SKILLIFY_WORKER_PATH}`);
-  }
-  if (existsSync(AUTOPULL_WORKER_PATH)) {
-    log(`  pi             autopull-worker installed -> ${AUTOPULL_WORKER_PATH}`);
+  if (workersInstalled) {
+    log(`  pi             workers installed -> ${WIKI_WORKER_DIR}`);
   }
 }
 

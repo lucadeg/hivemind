@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setFakeHome, clearFakeHome } from "../shared/fake-home.js";
 
 /**
  * Source-level coverage of src/hooks/session-notifications.ts. Bundle smoke
@@ -22,13 +23,13 @@ beforeEach(() => {
   TEMP_HOME = mkdtempSync(join(tmpdir(), "hivemind-notif-hook-"));
   ORIGINAL_HOME = process.env.HOME;
   ORIGINAL_WIKI = process.env.HIVEMIND_WIKI_WORKER;
-  process.env.HOME = TEMP_HOME;
+  setFakeHome(TEMP_HOME);
   delete process.env.HIVEMIND_WIKI_WORKER;
   vi.resetModules();
 });
 
 afterEach(() => {
-  process.env.HOME = ORIGINAL_HOME;
+  clearFakeHome();
   if (ORIGINAL_WIKI === undefined) delete process.env.HIVEMIND_WIKI_WORKER;
   else process.env.HIVEMIND_WIKI_WORKER = ORIGINAL_WIKI;
   rmSync(TEMP_HOME, { recursive: true, force: true });
@@ -70,19 +71,15 @@ async function loadHookModule() {
   vi.doMock("../../src/utils/stdin.js", () => ({
     readStdin: vi.fn().mockResolvedValue({ session_id: "test" }),
   }));
-  // Force a fresh module instance so the registerRule(welcomeRule) at top
-  // level runs against a clean registry per test.
+  // Reset registry to a clean state per test — welcome is no longer
+  // registered as a rule (it's the default fallback in pickPrimaryBanner)
+  // so there are no module-load-time registrations to worry about, but
+  // other tests in this suite may still register dummy rules.
   await import("../../src/notifications/index.js").then(m => m._resetRulesForTest());
   return import("../../src/hooks/session-notifications.js");
 }
 
 describe("session-notifications hook entry — main()", () => {
-  it("registers welcomeRule on module load", async () => {
-    await loadHookModule();
-    const { listRules } = await import("../../src/notifications/index.js");
-    expect(listRules().some(r => r.id === "welcome")).toBe(true);
-  });
-
   // Note: full happy-path delivery (creds present → emit) is exercised by the
   // bundle smoke tests in notifications.test.ts. We don't repeat it here
   // because dynamic-import + spyOn on process.stdout has a timing race in

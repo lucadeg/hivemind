@@ -7,11 +7,21 @@ import type {
   IFileSystem, FsStat, MkdirOptions, RmOptions, CpOptions,
   FileContent, BufferEncoding,
 } from "just-bash";
-import { normalizeContent } from "./grep-core.js";
+import { normalizeContent, emptySessionBodyNotice } from "./grep-core.js";
+import { readSessionEventCache } from "../hooks/session-event-cache.js";
 import { EmbedClient } from "../embeddings/client.js";
 import { embeddingSqlLiteral } from "../embeddings/sql.js";
 import { embeddingsDisabled } from "../embeddings/disable.js";
 import { buildVirtualIndexContent, INDEX_LIMIT_PER_SECTION } from "../hooks/virtual-table-query.js";
+import {
+  classifyPath,
+  composeGoalPath,
+  decomposeGoalPath,
+  type PathKind,
+} from "./goal-paths.js";
+import { handleGraphVfs } from "../graph/vfs-handler.js";
+import { handleDocsVfs } from "../docs/vfs-handler.js";
+import { makeQueryEmbedder } from "../docs/embed.js";
 
 interface ReadFileOptions { encoding?: BufferEncoding }
 interface WriteFileOptions { encoding?: BufferEncoding }
@@ -47,20 +57,52 @@ export function guessMime(filename: string): string {
 }
 
 function normalizeSessionMessage(path: string, message: unknown): string {
+  // A NULL/undefined message column must coerce to "" — not the JS value
+  // `undefined` (JSON.stringify(undefined) === undefined) which would leak into
+  // the joined output, and not the literal "null" text (JSON.stringify(null)).
+  if (message === null || message === undefined) return "";
   const raw = typeof message === "string" ? message : JSON.stringify(message);
+  // JSON.stringify can still return undefined for non-serializable values.
+  if (typeof raw !== "string") return "";
   return normalizeContent(path, raw);
 }
 
 function resolveEmbedDaemonPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "embeddings", "embed-daemon.js");
+  // This module is bundled to `<agent>/bundle/shell/deeplake-shell.js`,
+  // while the embed daemon lives one level up at
+  // `<agent>/bundle/embeddings/embed-daemon.js`. The earlier resolver
+  // forgot the `..` and pointed at the non-existent
+  // `bundle/shell/embeddings/embed-daemon.js`, which silently broke the
+  // pre-tool-use shell embed path on every agent.
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "embeddings", "embed-daemon.js");
 }
 
 function joinSessionMessages(path: string, messages: unknown[]): string {
-  return messages.map((message) => normalizeSessionMessage(path, message)).join("\n");
+  // Drop empty parts so bodyless rows don't turn into phantom blank lines (and
+  // so an all-empty session reconstructs to "" — the caller's cue to emit the
+  // empty-body notice rather than a silently-empty file).
+  return messages
+    .map((message) => normalizeSessionMessage(path, message))
+    .filter((part) => part.length > 0)
+    .join("\n");
 }
 
 function fsErr(code: string, msg: string, path: string): Error {
   return Object.assign(new Error(`${code}: ${msg}, '${path}'`), { code });
+}
+
+// Recover the bare capture sessionId from a VFS session path so a whole-session
+// read can hit the local event cache. Path shape (see buildSessionPath):
+//   /sessions/<user>/<user>_<org>_<ws>_<sessionId>.jsonl
+// The sessionId is a UUID (no underscores), so it is the last `_`-delimited
+// segment of the filename stem — recoverable even when user/org/ws contain
+// underscores. A non-matching path yields a value that simply misses the cache
+// (→ DB fallback), so this is best-effort and never load-bearing.
+function sessionIdFromVfsPath(p: string): string | null {
+  const file = p.split("/").pop() ?? "";
+  if (!file.endsWith(".jsonl")) return null;
+  const sid = file.slice(0, -".jsonl".length).split("_").pop() ?? "";
+  return sid.length > 0 ? sid : null;
 }
 
 // ── types ─────────────────────────────────────────────────────────────────────
@@ -74,6 +116,86 @@ interface PendingRow {
 }
 
 // ── DeeplakeFs ────────────────────────────────────────────────────────────────
+// ── Graph VFS bridge ──────────────────────────────────────────────────────────
+//
+// The codebase graph (Phase 1) lives at <memory-mount>/graph/. Its dispatcher
+// is `handleGraphVfs()` in src/graph/vfs-handler.ts — a single source of truth
+// shared between two consumers:
+//
+//   1. The pre-tool-use hook (Claude Code Bash/Read/Grep paths) — already
+//      wired in src/hooks/pre-tool-use.ts.
+//   2. This file, so the standalone deeplake-shell exposes the same VFS to
+//      whoever's poking at the mount manually (debug, scripted access, etc).
+//
+// The bridge is intentionally thin: detect the /graph/ prefix, strip it,
+// delegate. Path shape is documented in handleGraphVfs:
+//   /graph              -> directory listing (index.md, find/, show/)
+//   /graph/index.md     -> synthesized overview text
+//   /graph/find/<pat>   -> synthesized search results
+//   /graph/show/<key>   -> synthesized node detail
+//   /graph/find         -> placeholder dir (no children to list)
+//   /graph/show         -> placeholder dir (no children to list)
+//
+// The dispatcher is pure: no SQL, just reads the local snapshot file. The
+// shell's cwd (inherited from the invoking terminal) determines which repo's
+// graph to load.
+
+const GRAPH_ROOT = "/graph";
+const GRAPH_PREFIX = "/graph/";
+const GRAPH_DIRS = new Set([GRAPH_ROOT, "/graph/find", "/graph/show"]);
+
+function isGraphPath(p: string): boolean {
+  return p === GRAPH_ROOT || p.startsWith(GRAPH_PREFIX);
+}
+
+function isGraphDir(p: string): boolean {
+  return GRAPH_DIRS.has(p);
+}
+
+function graphSubpathOf(p: string): string {
+  // p is normalized: "/graph" -> "", "/graph/index.md" -> "index.md",
+  // "/graph/find/foo" -> "find/foo".
+  if (p === GRAPH_ROOT) return "";
+  return p.slice(GRAPH_PREFIX.length);
+}
+
+/**
+ * Synthesize file content for a /graph/* path by delegating to the same
+ * dispatcher the pre-tool-use hook uses. Throws ENOENT when the dispatcher
+ * reports not-found so the FS API stays well-behaved.
+ *
+ * The "no-graph" return (no local snapshot for this cwd) is rendered as the
+ * file body, NOT as ENOENT — the file conceptually exists; it just reports
+ * its own emptiness. Same semantics as /index.md when no rows exist yet.
+ */
+function readGraphFile(p: string, cwd: string): string {
+  const sub = graphSubpathOf(p);
+  const r = handleGraphVfs(sub, cwd);
+  if (r.kind === "ok") return r.body;
+  if (r.kind === "no-graph") return `(no-graph) ${r.message}`;
+  // not-found: surface as ENOENT so the shell shows the expected error
+  throw fsErr("ENOENT", `${r.message}`, p);
+}
+
+// Per-file docs live at <memory-mount>/docs/. Same thin-bridge pattern as
+// /graph/: detect the prefix, strip it, delegate to handleDocsVfs (the same
+// dispatcher the pre-tool-use hook uses). Unlike graph, docs are backed by a
+// SQL table so the bridge is ASYNC and needs the query seam + docs table.
+const DOCS_ROOT = "/docs";
+const DOCS_PREFIX = "/docs/";
+const DOCS_DIRS = new Set([DOCS_ROOT, "/docs/find"]);
+
+function isDocsPath(p: string): boolean {
+  return p === DOCS_ROOT || p.startsWith(DOCS_PREFIX);
+}
+function isDocsDir(p: string): boolean {
+  return DOCS_DIRS.has(p);
+}
+function docsSubpathOf(p: string): string {
+  if (p === DOCS_ROOT) return "";
+  return p.slice(DOCS_PREFIX.length);
+}
+
 export class DeeplakeFs implements IFileSystem {
   // path → Buffer (content) or null (exists but not fetched yet)
   private files = new Map<string, Buffer | null>();
@@ -95,6 +217,16 @@ export class DeeplakeFs implements IFileSystem {
   private sessionPaths = new Set<string>();
   private sessionsTable: string | null = null;
 
+  // Path-routed structured tables. When non-null, the VFS classifies
+  // each path (see ./goal-paths.ts) and dispatches reads/writes to
+  // the right table instead of the generic memory table. Null means
+  // the goal routing is disabled (test or legacy configurations).
+  private goalsTable: string | null = null;
+  // Per-file docs table, for /docs/ VFS reads + docs/find search. Null = off.
+  private docsTable: string | null = null;
+  /** Project scope for docs reads on shared tables (legacy '' rows included). */
+  private docsProject: string | null = null;
+
   // Embedding client lazily created on first flush. Lives as long as the process.
   private embedClient: EmbedClient | null = null;
 
@@ -112,11 +244,23 @@ export class DeeplakeFs implements IFileSystem {
     table: string,
     mount = "/memory",
     sessionsTable?: string,
+    extra?: { goalsTable?: string; docsTable?: string; docsProject?: string },
   ): Promise<DeeplakeFs> {
     const fs = new DeeplakeFs(client, table, mount);
     fs.sessionsTable = sessionsTable ?? null;
-    // Ensure the table exists before bootstrapping.
+    fs.goalsTable = extra?.goalsTable ?? null;
+    fs.docsTable = extra?.docsTable ?? null;
+    fs.docsProject = extra?.docsProject ?? null;
+    // Ensure the memory table + goals table exist before
+    // bootstrapping. Each ensure call is idempotent and lazy-heals
+    // any column drift from prior schema versions. Failures bubble
+    // up; the shell will report them but stay alive (the
+    // memory-side bootstrap catches its own errors below).
     await client.ensureTable();
+    if (fs.goalsTable) {
+      try { await client.ensureGoalsTable(fs.goalsTable); }
+      catch { /* keep bootstrap moving — goal routing degrades gracefully */ }
+    }
 
     // Bootstrap memory + sessions metadata in parallel.
     let sessionSyncOk = true;
@@ -126,6 +270,20 @@ export class DeeplakeFs implements IFileSystem {
         const rows = await client.query(sql);
         for (const row of rows) {
           const p = row["path"] as string;
+          // Goal-shaped paths belong exclusively to the dedicated
+          // hivemind_goals table. Pre-routing hook
+          // versions (<=0.7.4) wrote goals to the generic memory table
+          // as plain files; surfacing those here re-injects phantom
+          // goals into the VFS goal namespace — visible in `ls /goal/...`
+          // but absent from `hivemind goal list` (the CLI reads only the
+          // structured table). Skip them when the dedicated table is
+          // configured so the two views stay in sync. (When it is not
+          // configured, goal routing is off and these rows are the only
+          // copy, so we keep them.)
+          const kind = classifyPath(p);
+          if (kind === "goal" && fs.goalsTable) {
+            continue;
+          }
           fs.files.set(p, null);
           fs.meta.set(p, {
             size: Number(row["size_bytes"] ?? 0),
@@ -168,7 +326,41 @@ export class DeeplakeFs implements IFileSystem {
       }
     })() : Promise.resolve();
 
-    await Promise.all([memoryBootstrap, sessionsBootstrap]);
+    // Goals bootstrap — read the latest version of each row in the
+    // structured table and synthesize VFS paths for the cache.
+    // ls / cat then work naturally against the file map, while
+    // writes route to upsertRow which dispatches by path classifier.
+    const goalsBootstrap = fs.goalsTable ? (async () => {
+      try {
+        const goalRows = await client.query(
+          // One row per goal_id (UPDATE-or-INSERT model). Synthesize
+          // the canonical VFS path from owner / status / goal_id.
+          `SELECT goal_id, owner, status, content, created_at ` +
+          `FROM "${fs.goalsTable}" ORDER BY created_at DESC`
+        );
+        for (const row of goalRows) {
+          const owner = String(row["owner"] ?? "");
+          const status = String(row["status"] ?? "");
+          const goal_id = String(row["goal_id"] ?? "");
+          if (!owner || !status || !goal_id) continue;
+          if (status !== "opened" && status !== "in_progress" && status !== "closed") continue;
+          const p = composeGoalPath({ owner, status, goal_id });
+          const content = String(row["content"] ?? "");
+          fs.files.set(p, Buffer.from(content, "utf-8"));
+          fs.meta.set(p, {
+            size: Buffer.byteLength(content, "utf-8"),
+            mime: "text/markdown",
+            mtime: new Date(),
+          });
+          fs.addToTree(p);
+          fs.flushed.add(p);
+        }
+      } catch {
+        // Goals table may not exist yet — start empty.
+      }
+    })() : Promise.resolve();
+
+    await Promise.all([memoryBootstrap, sessionsBootstrap, goalsBootstrap]);
 
     return fs;
   }
@@ -248,6 +440,18 @@ export class DeeplakeFs implements IFileSystem {
   }
 
   private async upsertRow(r: PendingRow, embedding: number[] | null): Promise<void> {
+    // Path-routed structured tables: dispatch goal writes to
+    // the dedicated table with UPDATE-or-INSERT semantics (one row
+    // per goal_id, see upsertGoalRow).
+    // The generic memory path falls through to the existing UPDATE /
+    // INSERT shape below. Failures here propagate up to the flush
+    // chain which re-queues the row on the next tick.
+    const kind: PathKind = classifyPath(r.path);
+    if (kind === "goal" && this.goalsTable) {
+      await this.upsertGoalRow(r);
+      return;
+    }
+
     const text  = esc(r.contentText);
     const p     = esc(r.path);
     const fname = esc(r.filename);
@@ -277,6 +481,64 @@ export class DeeplakeFs implements IFileSystem {
       );
       this.flushed.add(r.path);
     }
+  }
+
+  /**
+   * UPDATE-or-INSERT for a goal row, keyed by goal_id. One row per
+   * goal forever — status changes, owner reassignments, and text
+   * edits all mutate the same row in place. The version column
+   * stays at 1 (vestigial in the schema; kept so the column is
+   * already there if we ever bring back the audit-trail pattern).
+   *
+   * Trade-off versus the prior INSERT-only-version-bump design:
+   *   - Pros: 1 row per goal makes the Deeplake table view obvious,
+   *     no row proliferation, simpler bootstrap queries.
+   *   - Cons: no audit trail; vulnerable to Deeplake's
+   *     UPDATE-coalescing quirk if two writes hit the same row
+   *     within microseconds. For the v1 single-user / small-team
+   *     workflow the user explicitly chose this trade-off.
+   */
+  private async upsertGoalRow(r: PendingRow): Promise<void> {
+    if (!this.goalsTable) throw new Error("goalsTable not configured");
+    const parts = decomposeGoalPath(r.path);
+    const safe = this.goalsTable;
+    const now = new Date().toISOString();
+    const createdAt = r.creationDate ?? now;
+    const updatedAt = r.lastUpdateDate ?? createdAt;
+    const existing = await this.client.query(
+      `SELECT id FROM "${safe}" WHERE goal_id = '${esc(parts.goal_id)}' LIMIT 1`
+    );
+    if (existing.length > 0) {
+      // Preserve created_at — a status transition or content edit must
+      // not reset the goal's creation timestamp (it drives created_at
+      // DESC ordering in the listing and bootstrap). Record the edit
+      // time in updated_at instead.
+      await this.client.query(
+        `UPDATE "${safe}" SET ` +
+        `owner = '${esc(parts.owner)}', ` +
+        `status = '${esc(parts.status)}', ` +
+        `content = E'${esc(r.contentText)}', ` +
+        `updated_at = '${esc(updatedAt)}' ` +
+        `WHERE goal_id = '${esc(parts.goal_id)}'`
+      );
+    } else {
+      const id = randomUUID();
+      await this.client.query(
+        `INSERT INTO "${safe}" (id, goal_id, owner, status, content, version, created_at, updated_at, agent, plugin_version) VALUES (` +
+        `'${id}', ` +
+        `'${esc(parts.goal_id)}', ` +
+        `'${esc(parts.owner)}', ` +
+        `'${esc(parts.status)}', ` +
+        `E'${esc(r.contentText)}', ` +
+        `1, ` +
+        `'${esc(createdAt)}', ` +
+        `'${esc(updatedAt)}', ` +
+        `'manual', ` +
+        `''` +
+        `)`
+      );
+    }
+    this.flushed.add(r.path);
   }
 
   // ── Virtual index.md generation ────────────────────────────────────────────
@@ -361,20 +623,48 @@ export class DeeplakeFs implements IFileSystem {
       const rows = await this.client.query(
         `SELECT path, message, creation_date FROM "${this.sessionsTable}" WHERE path IN (${inList}) ORDER BY path, creation_date ASC`
       );
-      const grouped = new Map<string, string[]>();
+      const grouped = new Map<string, unknown[]>();
       for (const row of rows) {
         const p = row["path"] as string;
         const current = grouped.get(p) ?? [];
-        current.push(normalizeSessionMessage(p, row["message"]));
+        current.push(row["message"]);
         grouped.set(p, current);
       }
-      for (const [p, parts] of grouped) {
-        this.files.set(p, Buffer.from(parts.join("\n"), "utf-8"));
+      for (const [p, messages] of grouped) {
+        const text = joinSessionMessages(p, messages);
+        this.files.set(p, Buffer.from(text || emptySessionBodyNotice(messages.length), "utf-8"));
       }
     }
   }
 
   // ── IFileSystem: reads ────────────────────────────────────────────────────
+
+  /**
+   * Load a session's message rows for a whole-file read.
+   *
+   * Prefers the local per-session event cache the capture hook appends to
+   * (row-for-row identical to the sessions-table `message` column) so a re-read
+   * of a fat "mega-session" costs a few ms + zero backend load instead of
+   * re-materializing the entire `message` column (tens of MB, multi-second cold
+   * on the backend). The cache is a strict optimization: on any miss — session
+   * captured on another machine, cache disabled/pruned, or unreadable — we fall
+   * back to the full ordered DB read, which stays the source of truth. This
+   * mirrors the wiki-worker's cache-first strategy (see session-event-cache.ts);
+   * the difference is the VFS needs the WHOLE session (cat/grep), so the DB
+   * fallback stays the unbounded `ORDER BY creation_date ASC` read.
+   */
+  private async loadSessionMessages(p: string): Promise<unknown[]> {
+    const sid = sessionIdFromVfsPath(p);
+    if (sid) {
+      const cached = readSessionEventCache(sid);
+      if (cached && cached.length > 0) return cached;
+    }
+    if (!this.sessionsTable) return [];
+    const rows = await this.client.query(
+      `SELECT message FROM "${this.sessionsTable}" WHERE path = '${esc(p)}' ORDER BY creation_date ASC`
+    );
+    return rows.map((row) => row["message"]);
+  }
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
     const p = normPath(path);
@@ -389,13 +679,11 @@ export class DeeplakeFs implements IFileSystem {
     const pend = this.pending.get(p);
     if (pend) { const buf = Buffer.from(pend.contentText, "utf-8"); this.files.set(p, buf); return buf; }
 
-    // 3. Session files: concatenate rows from sessions table
+    // 3. Session files: local event cache first, then full DB read.
     if (this.sessionPaths.has(p) && this.sessionsTable) {
-      const rows = await this.client.query(
-        `SELECT message FROM "${this.sessionsTable}" WHERE path = '${esc(p)}' ORDER BY creation_date ASC`
-      );
-      if (rows.length === 0) throw fsErr("ENOENT", "no such file or directory", p);
-      const text = joinSessionMessages(p, rows.map((row) => row["message"]));
+      const messages = await this.loadSessionMessages(p);
+      if (messages.length === 0) throw fsErr("ENOENT", "no such file or directory", p);
+      const text = joinSessionMessages(p, messages) || emptySessionBodyNotice(messages.length);
       const buf = Buffer.from(text, "utf-8");
       this.files.set(p, buf);
       return buf;
@@ -413,6 +701,22 @@ export class DeeplakeFs implements IFileSystem {
 
   async readFile(path: string, _opts?: ReadFileOptions | BufferEncoding): Promise<string> {
     const p = normPath(path);
+    // Graph VFS bridge — delegate to the shared dispatcher BEFORE the
+    // dirs/files cache check, otherwise /graph/index.md would race with a
+    // hypothetical real "graph" dir entry.
+    if (isGraphPath(p)) {
+      if (isGraphDir(p)) throw fsErr("EISDIR", "illegal operation on a directory", p);
+      return readGraphFile(p, process.cwd());
+    }
+    // Docs VFS bridge — same as graph, but async (SQL-backed) and delegating to
+    // handleDocsVfs. Makes browse + docs/find work in the shell path (codex /
+    // cursor / hermes / interactive), not just the pre-tool-use hook (Claude).
+    if (isDocsPath(p) && this.docsTable) {
+      if (isDocsDir(p)) throw fsErr("EISDIR", "illegal operation on a directory", p);
+      const r = await handleDocsVfs(docsSubpathOf(p), (sql) => this.client.query(sql), this.docsTable, { embedQuery: makeQueryEmbedder(), project: this.docsProject ?? undefined });
+      if (r.kind === "ok") return r.body;
+      throw fsErr("ENOENT", `${r.message}`, p);
+    }
     if (this.dirs.has(p) && !this.files.has(p)) throw fsErr("EISDIR", "illegal operation on a directory", p);
 
     // Virtual index.md: if no real row exists, generate from summary rows
@@ -441,13 +745,11 @@ export class DeeplakeFs implements IFileSystem {
     const pend = this.pending.get(p);
     if (pend) return pend.contentText;
 
-    // Session files: concatenate rows from sessions table, ordered by creation_date
+    // Session files: local event cache first, then full DB read.
     if (this.sessionPaths.has(p) && this.sessionsTable) {
-      const rows = await this.client.query(
-        `SELECT message FROM "${this.sessionsTable}" WHERE path = '${esc(p)}' ORDER BY creation_date ASC`
-      );
-      if (rows.length === 0) throw fsErr("ENOENT", "no such file or directory", p);
-      const text = joinSessionMessages(p, rows.map((row) => row["message"]));
+      const messages = await this.loadSessionMessages(p);
+      if (messages.length === 0) throw fsErr("ENOENT", "no such file or directory", p);
+      const text = joinSessionMessages(p, messages) || emptySessionBodyNotice(messages.length);
       const buf = Buffer.from(text, "utf-8");
       this.files.set(p, buf);
       return text;
@@ -547,11 +849,58 @@ export class DeeplakeFs implements IFileSystem {
   async exists(path: string): Promise<boolean> {
     const p = normPath(path);
     if (p === "/index.md") return true; // Virtual index always exists
+    if (isGraphPath(p)) {
+      // CodeRabbit P1: the old "everything under /graph/ exists" was too
+      // broad. A bogus path like /graph/find/<no-such-pattern> would
+      // exists-true and confuse callers (e.g. shell write/append flows
+      // that check exists() before touching the path). Tighten:
+      //   - /graph, /graph/find, /graph/show are always-true dirs
+      //   - /graph/<endpoint>/<arg> only exists when the dispatcher
+      //     returns a non-not-found result (ok OR no-graph — both render
+      //     conceptual file content, just one happens to be a stub
+      //     message; the path is addressable either way).
+      if (isGraphDir(p)) return true;
+      const r = handleGraphVfs(graphSubpathOf(p), process.cwd());
+      return r.kind === "ok" || r.kind === "no-graph";
+    }
+    // Docs VFS — dirs always exist; a leaf/find query is addressable (readFile
+    // renders content or a friendly "no match" body, never not-found for find).
+    if (isDocsPath(p) && this.docsTable) return true;
     return this.files.has(p) || this.dirs.has(p);
   }
 
   async stat(path: string): Promise<FsStat> {
     const p = normPath(path);
+    // Graph VFS — synthesize stat without parsing the snapshot. Anything
+    // matching /graph(/find|/show)? is a directory; anything else under
+    // /graph/ is a file (synthesized at readFile time).
+    if (isGraphPath(p)) {
+      // CodeRabbit P1: align stat() with the tightened exists() — non-dir
+      // /graph paths must reject when the dispatcher says not-found.
+      // Otherwise tools that stat-before-read get inconsistent answers
+      // (exists=false but stat=true) and break the standard FS contract.
+      if (!isGraphDir(p)) {
+        const r = handleGraphVfs(graphSubpathOf(p), process.cwd());
+        if (r.kind === "not-found") throw fsErr("ENOENT", "no such file or directory", p);
+      }
+      const dir = isGraphDir(p);
+      return {
+        isFile: !dir, isDirectory: dir, isSymbolicLink: false,
+        mode: dir ? 0o755 : 0o644,
+        size: 0, // synthesized; cheaper than computing the body just to size it
+        mtime: new Date(),
+      };
+    }
+    // Docs VFS — /docs and /docs/find are directories; any other /docs/ path is
+    // a (synthesized) file. Kept cheap (no SQL); readFile surfaces a real
+    // not-found as ENOENT.
+    if (isDocsPath(p) && this.docsTable) {
+      const dir = isDocsDir(p);
+      return {
+        isFile: !dir, isDirectory: dir, isSymbolicLink: false,
+        mode: dir ? 0o755 : 0o644, size: 0, mtime: new Date(),
+      };
+    }
     const isFile = this.files.has(p);
     const isDir  = this.dirs.has(p);
     // Virtual index.md: always exists as a file
@@ -583,6 +932,13 @@ export class DeeplakeFs implements IFileSystem {
   async realpath(path: string): Promise<string> {
     const p = normPath(path);
     if (p === "/index.md") return p; // Virtual index always exists
+    if (isGraphPath(p)) {
+      // Same alignment as stat(): unknown leaf path → ENOENT.
+      if (isGraphDir(p)) return p;
+      const r = handleGraphVfs(graphSubpathOf(p), process.cwd());
+      if (r.kind === "ok" || r.kind === "no-graph") return p;
+      throw fsErr("ENOENT", "no such file or directory", p);
+    }
     if (!this.files.has(p) && !this.dirs.has(p)) throw fsErr("ENOENT", "no such file or directory", p);
     return p;
   }
@@ -608,11 +964,32 @@ export class DeeplakeFs implements IFileSystem {
 
   async readdir(path: string): Promise<string[]> {
     const p = normPath(path);
+    // Graph VFS — directory listings synthesized from a fixed taxonomy.
+    if (p === GRAPH_ROOT) return ["index.md", "find", "show"];
+    // Docs VFS — same synthesized taxonomy so `ls /docs` never ENOTDIRs.
+    if (this.docsTable && (p === "/docs" || p === "/docs/find")) {
+      return p === "/docs" ? ["index.md", "find"] : [];
+    }
+    if (p === "/graph/find" || p === "/graph/show") {
+      // No children to enumerate: arguments are user-supplied patterns, not
+      // a finite set we could list. Return empty so `ls` shows nothing
+      // (rather than throwing — the dir conceptually exists, it's just
+      // dispatched-on-demand).
+      return [];
+    }
     if (!this.dirs.has(p)) throw fsErr("ENOTDIR", "not a directory", p);
     const entries = [...(this.dirs.get(p) ?? [])];
     // Virtual index.md: always show in root listing even if no real row exists
     if (p === "/" && !entries.includes("index.md")) {
       entries.push("index.md");
+    }
+    // Surface the graph subtree in the root listing.
+    if (p === "/" && !entries.includes("graph")) {
+      entries.push("graph");
+    }
+    // Surface the docs subtree too, when the feature is configured.
+    if (p === "/" && this.docsTable && !entries.includes("docs")) {
+      entries.push("docs");
     }
     return entries;
   }
@@ -622,6 +999,27 @@ export class DeeplakeFs implements IFileSystem {
     const p = normPath(path);
     return names.map(name => {
       const child = p === "/" ? `/${name}` : `${p}/${name}`;
+      // CodeRabbit P1: graph entries aren't in this.files/this.dirs (they're
+      // synthesized). Classify them by the same isGraphDir taxonomy used by
+      // exists()/stat() so tools that consume DirentEntry get accurate types
+      // (e.g. `ls -F` shows trailing slash on /graph and /graph/find).
+      if (isGraphPath(child)) {
+        return {
+          name,
+          isFile: !isGraphDir(child),
+          isDirectory: isGraphDir(child),
+          isSymbolicLink: false,
+        };
+      }
+      // Docs entries are synthesized too — classify by the docs taxonomy.
+      if (this.docsTable && isDocsPath(child)) {
+        return {
+          name,
+          isFile: !isDocsDir(child),
+          isDirectory: isDocsDir(child),
+          isSymbolicLink: false,
+        };
+      }
       return {
         name,
         isFile: (this.files.has(child) || child === "/index.md") && !this.dirs.has(child),
@@ -639,6 +1037,44 @@ export class DeeplakeFs implements IFileSystem {
     if (!this.files.has(p) && !this.dirs.has(p)) {
       if (opts?.force) return;
       throw fsErr("ENOENT", "no such file or directory", p);
+    }
+
+    // Path-routed soft-close: `rm` on a goal path does NOT delete the
+    // row. It writes a new v=N+1 with status='closed' (soft-close,
+    // preserves audit trail). The agent expects the file to be gone
+    // from the opened/in_progress folder; we move the cache entry
+    // to the canonical closed/<goal_id>.md path so subsequent ls of
+    // the source folder reflects the absence, while cat on the new
+    // closed path returns the same content.
+    if (this.goalsTable && classifyPath(p) === "goal") {
+      const parts = decomposeGoalPath(p);
+      if (parts.status === "closed") {
+        // Already closed — codex's "rm-on-closed" edge case. Treat as
+        // a true hard-delete request? For v1 we make it a no-op so
+        // the audit trail is fully preserved and the agent can not
+        // accidentally wipe history.
+        this.removeFromTree(p);
+        return;
+      }
+      const closedPath = composeGoalPath({ ...parts, status: "closed" });
+      const contentBuf = this.files.get(p);
+      const content = contentBuf instanceof Buffer ? contentBuf.toString("utf-8") : "";
+      await this.upsertGoalRow({
+        path: closedPath,
+        filename: basename(closedPath),
+        contentText: content,
+        mimeType: "text/markdown",
+        sizeBytes: Buffer.byteLength(content, "utf-8"),
+        creationDate: undefined,
+        lastUpdateDate: new Date().toISOString(),
+      });
+      // Move the cache entry from opened/ to closed/.
+      this.files.set(closedPath, contentBuf ?? null);
+      this.meta.set(closedPath, this.meta.get(p) ?? { size: 0, mime: "text/markdown", mtime: new Date() });
+      this.addToTree(closedPath);
+      this.flushed.add(closedPath);
+      this.removeFromTree(p);
+      return;
     }
 
     if (this.dirs.has(p)) {
@@ -689,6 +1125,37 @@ export class DeeplakeFs implements IFileSystem {
     const s = normPath(src), d = normPath(dest);
     if (this.sessionPaths.has(s)) throw fsErr("EPERM", "session files are read-only", s);
     if (this.sessionPaths.has(d)) throw fsErr("EPERM", "session files are read-only", d);
+
+    // Goal status transition: single INSERT v=N+1 with the new
+    // status, no cp+rm dance (which would otherwise double-write to
+    // the goals table). Also enforces the goal_id invariant: a goal
+    // path mv cannot rename the UUID, only the status component.
+    if (this.goalsTable && classifyPath(s) === "goal" && classifyPath(d) === "goal") {
+      const from = decomposeGoalPath(s);
+      const to = decomposeGoalPath(d);
+      if (from.goal_id !== to.goal_id || from.owner !== to.owner) {
+        throw fsErr("EPERM", "cannot rename goal_id or owner via mv (only status)", d);
+      }
+      if (!this.files.has(s)) throw fsErr("ENOENT", "no such file or directory", s);
+      const contentBuf = this.files.get(s);
+      const content = contentBuf instanceof Buffer ? contentBuf.toString("utf-8") : "";
+      await this.upsertGoalRow({
+        path: d,
+        filename: basename(d),
+        contentText: content,
+        mimeType: "text/markdown",
+        sizeBytes: Buffer.byteLength(content, "utf-8"),
+        creationDate: undefined,
+        lastUpdateDate: new Date().toISOString(),
+      });
+      this.files.set(d, contentBuf ?? null);
+      this.meta.set(d, this.meta.get(s) ?? { size: 0, mime: "text/markdown", mtime: new Date() });
+      this.addToTree(d);
+      this.flushed.add(d);
+      this.removeFromTree(s);
+      return;
+    }
+
     await this.cp(src, dest, { recursive: true });
     await this.rm(src, { recursive: true, force: true });
   }

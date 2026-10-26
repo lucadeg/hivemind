@@ -20,8 +20,9 @@ import {
   resolveSkillsRoot,
   writeNewSkill,
   mergeSkill,
+  capSkillName,
 } from "./skill-writer.js";
-import { renderExistingSkillsBlock } from "./existing-skills.js";
+import { renderExistingSkillsBlock, type ExistingSkillsBlock } from "./existing-skills.js";
 import { insertSkillRow } from "./skills-table.js";
 import { parseVerdict, type Verdict } from "./gate-parser.js";
 import { runGate, type Agent } from "./gate-runner.js";
@@ -69,9 +70,30 @@ interface WorkerConfig {
   piModel?: string;
   skillifyLog: string;
   currentSessionId?: string;
+  /**
+   * Optional pre-built dispatch table that openclaw's spawn helper threads
+   * through so the worker bundle can repopulate its own
+   * `globalThis.__hivemind_tuning__`. Each process has its own globalThis,
+   * so values populated in the openclaw plugin (the spawn's parent) don't
+   * survive the fork. esbuild's `define` rewrote `process.env.HIVEMIND_X`
+   * reads in the openclaw worker bundle to look at that global, so we
+   * have to restore it here BEFORE any shared module function fires. The
+   * other agents' worker bundles read `process.env` at runtime as usual
+   * (this field stays undefined for them, the assignment below is a no-op).
+   * See PR #170 for the ClawHub-scan rewrite.
+   */
+  tuning?: Record<string, string | undefined>;
 }
 
 const cfg: WorkerConfig = JSON.parse(readFileSync(process.argv[2], "utf-8"));
+
+// Restore the tuning dispatch BEFORE any imported shared-module function
+// runs. Function-scoped env reads (every `process.env.HIVEMIND_X` in this
+// bundle was rewritten to `globalThis.__hivemind_tuning__?.X` for openclaw)
+// only fire from here onward, so an assignment at this point is sufficient.
+// On non-openclaw worker bundles `cfg.tuning` is undefined and this is a
+// no-op write of an empty object.
+(globalThis as Record<string, unknown>).__hivemind_tuning__ = cfg.tuning ?? {};
 const tmpDir = cfg.tmpDir;
 const verdictPath = join(tmpDir, "verdict.json");
 const promptPath = join(tmpDir, "prompt.txt");
@@ -241,8 +263,7 @@ function renderPairsBlock(pairs: Pair[]): string {
 // unit-test the project+global merging and the [global, read-only] tagging
 // without instantiating the whole worker (which reads its config from argv).
 
-function buildPrompt(pairs: Pair[]): string {
-  const existing = renderExistingSkillsBlock(cfg.cwd, EXISTING_SKILLS_CHAR_CAP);
+function buildPrompt(pairs: Pair[], existing: ExistingSkillsBlock): string {
   const mergeTargetsClause = existing.mergeTargetNames.length > 0
     ? `MERGE is allowed only if your "name" is EXACTLY one of: [${existing.mergeTargetNames.join(", ")}]. Any other name MUST use KEEP, not MERGE.`
     : `MERGE is FORBIDDEN — there are no existing skills to merge into. Use KEEP or SKIP only.`;
@@ -265,6 +286,10 @@ function buildPrompt(pairs: Pair[]): string {
     `  Tags like [project, author=alice] / [global, author=bob] tell you whose skill it is.`,
     `- Skill bodies should follow the existing style: short sections (When to use, Workflow,`,
     `  Anti-patterns), concrete commands and file paths drawn from the exchanges, no marketing.`,
+    `- "trigger" is REQUIRED for KEEP and MERGE: one concrete activation condition phrased`,
+    `  'Use this skill when <situation>'. It is folded into the description the host agent`,
+    `  reads to decide whether to invoke the skill, so make it specific (name the task,`,
+    `  error, or tool), never generic restatement of the title.`,
     ``,
     `=== EXISTING SKILLS (all MERGE-eligible; [global, author=X] entries from teammate X mean`,
     `cross-author MERGE auto-promotes scope to team) ===`,
@@ -284,8 +309,8 @@ function buildPrompt(pairs: Pair[]): string {
     `{`,
     `  "verdict": "KEEP" | "SKIP" | "MERGE",`,
     `  "name": "<kebab-case skill name; for MERGE, the existing skill name>",`,
-    `  "description": "<one-line>",`,
-    `  "trigger": "<short trigger description, optional>",`,
+    `  "description": "<one-line: what the skill does>",`,
+    `  "trigger": "<REQUIRED for KEEP/MERGE: one concrete activation condition, phrased 'Use this skill when <situation>'>",`,
     `  "body": "<full SKILL.md body WITHOUT frontmatter; KEEP and MERGE only>",`,
     `  "reason": "<one-line justification>"`,
     `}`,
@@ -365,7 +390,8 @@ async function main(): Promise<void> {
 
     wlog(`extracted ${allPairs.length} pairs across ${usable.length} sessions`);
 
-    const prompt = buildPrompt(allPairs);
+    const existing = renderExistingSkillsBlock(cfg.cwd, EXISTING_SKILLS_CHAR_CAP, cfg.userName);
+    const prompt = buildPrompt(allPairs, existing);
     writeFileSync(promptPath, prompt);
 
     const gateAgent = (cfg.gateAgent ?? cfg.agent) as Agent;
@@ -374,6 +400,10 @@ async function main(): Promise<void> {
       agent: gateAgent,
       prompt,
       bin: cfg.gateBin,
+      // The prompt offers the model a verdict path inside tmpDir, which lives
+      // outside the session cwd. Grant it explicitly so the Write-tool branch
+      // survives an enterprise policy that disables bypassPermissions.
+      grants: { addDirs: [tmpDir], allowedTools: ["Read", "Write"] },
       cursorModel: cfg.cursorModel,
       hermesProvider: cfg.hermesProvider,
       hermesModel: cfg.hermesModel,
@@ -402,6 +432,12 @@ async function main(): Promise<void> {
       return;
     }
     wlog(`verdict source: ${source}`);
+
+    // Note: the 64-char loader-limit cap is applied by writeNewSkill (the write
+    // seam) and its canonical name is read back from the result below, so the
+    // recorded identity always matches what lands on disk. MERGE keeps the
+    // target's exact name (mergeSkill does not cap), so a legacy over-long
+    // target is found and updated rather than forked into a truncated v1.
 
     wlog(`verdict=${verdict.verdict} name=${verdict.name ?? "-"} reason=${verdict.reason ?? "-"}`);
 
@@ -444,6 +480,7 @@ async function main(): Promise<void> {
         contributors: string[];
       },
       verdict: Verdict,
+      install: "project" | "global" = cfg.install,
     ): Promise<void> {
       // Author stamped on the DB row is the *original* author when one is
       // known (preserves lineage across merges); falls back to the current
@@ -470,11 +507,12 @@ async function main(): Promise<void> {
         await insertSkillRow({
           query,
           tableName: cfg.skillsTable,
+          workspaceId: cfg.workspaceId,
           name: verdict.name!,
           project: cfg.project,
           projectKey: cfg.projectKey,
           localPath: result.path,
-          install: cfg.install,
+          install,
           sourceSessions,
           sourceAgent: cfg.agent,
           scope,
@@ -497,6 +535,21 @@ async function main(): Promise<void> {
       }
     }
 
+    // A KEEP under the name of an existing merge target would start a second
+    // v1 chain under that name (the fork users see as duplicates). Continue
+    // the existing chain instead.
+    const keepTarget = verdict.verdict === "KEEP" && verdict.name
+      ? existing.mergeTargets[capSkillName(verdict.name)]
+      : undefined;
+    if (keepTarget) {
+      wlog(`KEEP name matches existing skill ${verdict.name} — merging instead`);
+      verdict.verdict = "MERGE";
+      verdict.name = capSkillName(verdict.name!);
+    }
+    const mergeTarget = verdict.verdict === "MERGE" && verdict.name
+      ? existing.mergeTargets[verdict.name]
+      : undefined;
+
     if (verdict.verdict === "KEEP" && verdict.name && verdict.body) {
       try {
         const result = writeNewSkill({
@@ -510,6 +563,9 @@ async function main(): Promise<void> {
           author: cfg.userName,
         });
         wlog(`wrote new skill: ${result.path}`);
+        // Adopt the canonical (possibly length-capped) name writeNewSkill wrote
+        // so local state + the org row match the frontmatter/dir on disk.
+        verdict.name = result.name;
         recordSkill(cfg.projectKey, verdict.name, watermarkUuid, watermarkDate);
         await recordToDeeplake(result, verdict);
       } catch (e: any) {
@@ -519,7 +575,8 @@ async function main(): Promise<void> {
     } else if (verdict.verdict === "MERGE" && verdict.name && verdict.body) {
       try {
         const result = mergeSkill({
-          skillsRoot: resolveSkillsRoot(cfg.install, cfg.cwd),
+          skillsRoot: mergeTarget?.skillsRoot ?? resolveSkillsRoot(cfg.install, cfg.cwd),
+          dirName: mergeTarget?.dirName,
           name: verdict.name,
           description: verdict.description,
           body: verdict.body,
@@ -529,7 +586,7 @@ async function main(): Promise<void> {
         });
         wlog(`merged into skill: ${result.path} (v${result.version})`);
         recordSkill(cfg.projectKey, verdict.name, watermarkUuid, watermarkDate);
-        await recordToDeeplake(result, verdict);
+        await recordToDeeplake(result, verdict, mergeTarget?.install);
       } catch (e: any) {
         // The gate sometimes hallucinates a MERGE target that exists in the
         // user's global skills (~/.claude/skills/) but not in this project.
@@ -548,6 +605,8 @@ async function main(): Promise<void> {
               author: cfg.userName,
             });
             wlog(`wrote new skill (merge fallback): ${result.path}`);
+            // Adopt the canonical capped name so state/org row match disk.
+            verdict.name = result.name;
             recordSkill(cfg.projectKey, verdict.name, watermarkUuid, watermarkDate);
             await recordToDeeplake(result, verdict);
           } catch (e2: any) {

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const stdinMock = vi.fn();
 const loadConfigMock = vi.fn();
@@ -12,7 +15,13 @@ const localManifestMock = vi.fn();
 
 vi.mock("../../src/utils/stdin.js", () => ({ readStdin: (...a: unknown[]) => stdinMock(...a) }));
 vi.mock("../../src/config.js", () => ({ loadConfig: (...a: unknown[]) => loadConfigMock(...a) }));
-vi.mock("../../src/commands/auth.js", () => ({ loadCredentials: (...a: unknown[]) => loadCredentialsMock(...a) }));
+vi.mock("../../src/commands/auth.js", () => ({
+  loadCredentials: (...a: unknown[]) => loadCredentialsMock(...a),
+  // Pass-through stub — the heal helper is unit-tested in tests/claude-code/auth.test.ts.
+  // Returning creds unchanged keeps these hook tests focused on the hook's own logic.
+  healDriftedOrgToken: async (creds: unknown) => creds,
+  resolveWorkspaceOverride: async (creds: unknown) => ({ creds }),
+}));
 vi.mock("../../src/utils/debug.js", () => ({ log: (_tag: string, msg: string) => debugLogMock(msg) }));
 vi.mock("../../src/utils/version-check.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/utils/version-check.js")>();
@@ -25,6 +34,7 @@ vi.mock("../../src/deeplake-api.js", () => ({
     query(sql: string) { return queryMock(sql); }
     ensureTable(...a: unknown[]) { return ensureTableMock(...a); }
     ensureSessionsTable(...a: unknown[]) { return ensureSessionsTableMock(...a); }
+    async knownTablesOrNull() { return null; }
   },
 }));
 // autoUpdate mocked at the boundary — exhaustively tested in
@@ -45,6 +55,11 @@ const validConfig = {
   token: "t", apiUrl: "http://example", orgId: "o", orgName: "acme",
   workspaceId: "default", userName: "alice",
   tableName: "memory", sessionsTableName: "sessions",
+  // T6 fields — needed so the renderer's sqlIdent doesn't render
+  // FROM "undefined" when the mock loadConfig is consulted.
+  rulesTableName: "hivemind_rules",
+  goalsTableName: "hivemind_goals",
+  skillsTableName: "skills",
 };
 
 async function runHook(env: Record<string, string | undefined> = {}): Promise<void> {
@@ -99,7 +114,8 @@ describe("hermes session-start hook — placeholder creation", () => {
     queryMock.mockResolvedValueOnce([]); // SELECT
     queryMock.mockResolvedValueOnce([]); // INSERT
     await runHook();
-    expect(queryMock).toHaveBeenCalledTimes(2);
+    // 2 placeholder + 1 renderer (rules only) = 3.
+    expect(queryMock).toHaveBeenCalledTimes(4);
     const insertSql = queryMock.mock.calls[1][0] as string;
     expect(insertSql).toMatch(/INSERT INTO "memory"/);
     expect(insertSql).toContain("'hermes'");
@@ -109,7 +125,8 @@ describe("hermes session-start hook — placeholder creation", () => {
   it("skips INSERT when placeholder already exists", async () => {
     queryMock.mockResolvedValueOnce([{ path: "/summaries/alice/ses-1.md" }]);
     await runHook();
-    expect(queryMock).toHaveBeenCalledTimes(1);
+    // 1 placeholder SELECT + 1 renderer (rules only) = 2.
+    expect(queryMock).toHaveBeenCalledTimes(3);
   });
 
   it("skipped entirely when no token", async () => {
@@ -118,9 +135,19 @@ describe("hermes session-start hook — placeholder creation", () => {
     expect(queryMock).not.toHaveBeenCalled();
   });
 
-  it("skipped when HIVEMIND_CAPTURE=false", async () => {
+  it("HIVEMIND_CAPTURE=false: no placeholder, no DDL ensure, but renderer still runs (codex P2 pass 2 + pass 4)", async () => {
+    // See cursor session-start tests for the identical contract.
+    // ensure*Table are DDL writes gated on captureEnabled; renderer
+    // is read-only and runs regardless.
     await runHook({ HIVEMIND_CAPTURE: "false" });
-    expect(queryMock).not.toHaveBeenCalled();
+    // Explicit negative assertion: a regression that re-enables DDL on
+    // the read-only path would silently re-introduce CREATE TABLE /
+    // CREATE INDEX from the capture-disabled hook. CodeRabbit on PR
+    // #193 flagged the original count-only check as insufficient.
+    expect(ensureTableMock).not.toHaveBeenCalled();
+    expect(ensureSessionsTableMock).not.toHaveBeenCalled();
+    expect(queryMock).toHaveBeenCalledTimes(2); // rules + goals
+    expect(queryMock.mock.calls[0][0]).toMatch(/^SELECT .* FROM "hivemind_rules"/);
   });
 
   it("DB error is swallowed and logged (does not crash the hook)", async () => {
@@ -154,9 +181,26 @@ describe("hermes session-start hook — context payload", () => {
 
   it("falls back to orgId in the org line when orgName is missing", async () => {
     loadCredentialsMock.mockReturnValue({ token: "t", orgId: "o-99" });
+    loadConfigMock.mockReturnValue({ ...validConfig, orgId: "o-99", orgName: undefined });
     await runHook();
     const payload = JSON.parse(consoleLogMock.mock.calls[0][0] as string);
     expect(payload.context).toContain("org: o-99");
+  });
+
+  it("identity line falls back to the stored creds when loadConfig returns null", async () => {
+    loadConfigMock.mockReturnValue(null);
+    loadCredentialsMock.mockReturnValue({ token: "t", orgName: "creds-org", workspaceId: "creds-ws" });
+    await runHook();
+    const payload = JSON.parse(consoleLogMock.mock.calls[0][0] as string);
+    expect(payload.context).toContain("Logged in to Deeplake as org: creds-org (workspace: creds-ws)");
+  });
+
+  it("identity line uses orgId and the 'default' workspace when creds omit them", async () => {
+    loadConfigMock.mockReturnValue(null);
+    loadCredentialsMock.mockReturnValue({ token: "t", orgId: "org-id-1" });
+    await runHook();
+    const payload = JSON.parse(consoleLogMock.mock.calls[0][0] as string);
+    expect(payload.context).toContain("Logged in to Deeplake as org: org-id-1 (workspace: default)");
   });
 
   it("omits the version notice when getInstalledVersion returns null", async () => {
@@ -194,7 +238,11 @@ describe("hermes session-start hook — local mined skills note", () => {
     loadCredentialsMock.mockReturnValue(null);
     await runHook();
     const payload = JSON.parse(consoleLogMock.mock.calls[0][0] as string);
-    expect(payload.context).not.toContain("local skill");
+    // Match the mined-skills note's own signature, not the bare substring
+    // "local skill" — the always-present skillify command reference now
+    // documents `push <skill-name>` ("upload a local skill ..."), which would
+    // otherwise false-positive here.
+    expect(payload.context).not.toContain("from past 'hivemind skillify mine-local'");
     expect(payload.context).not.toContain("live in");
   });
 
@@ -232,5 +280,46 @@ describe("hermes session-start hook — local mined skills note", () => {
     const insertSql = queryMock.mock.calls[1]?.[0] as string;
     // Either "unknown" or empty-string-as-project — the branch is exercised either way.
     expect(insertSql).toBeTruthy();
+  });
+});
+
+describe("hermes session-start hook — per-directory .hivemind", () => {
+  let hmDir: string;
+  afterEach(() => { if (hmDir) rmSync(hmDir, { recursive: true, force: true }); });
+
+  function withHivemind(body: Record<string, unknown>): void {
+    hmDir = mkdtempSync(join(tmpdir(), "hermes-hivemind-"));
+    writeFileSync(join(hmDir, ".hivemind"), JSON.stringify(body));
+    stdinMock.mockResolvedValue({ session_id: "ses-1", cwd: hmDir });
+  }
+
+  function banner(): string {
+    return JSON.parse(consoleLogMock.mock.calls[0][0] as string).context;
+  }
+
+  it("a routing .hivemind discloses the routed org/workspace in the banner", async () => {
+    withHivemind({ orgId: "routed-org", workspaceId: "routed-ws" });
+    await runHook({ HIVEMIND_ORG_ID: undefined, HIVEMIND_WORKSPACE_ID: undefined });
+    expect(banner()).toContain("org: routed-org (workspace: routed-ws)");
+    expect(banner()).toContain("routed by");
+    expect(ensureTableMock).toHaveBeenCalled();
+  });
+
+  it("collect:false makes the hook fully inactive — no context, no API calls", async () => {
+    withHivemind({ collect: false });
+    await runHook({ HIVEMIND_ORG_ID: undefined, HIVEMIND_WORKSPACE_ID: undefined });
+    expect(consoleLogMock).not.toHaveBeenCalled();
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(ensureTableMock).not.toHaveBeenCalled();
+    expect(ensureSessionsTableMock).not.toHaveBeenCalled();
+  });
+
+  it("env HIVEMIND_ORG_ID overrides a routing .hivemind (env > file)", async () => {
+    withHivemind({ orgId: "routed-org", workspaceId: "routed-ws" });
+    loadConfigMock.mockReturnValue({ ...validConfig, orgId: "env-org", orgName: "env-org" });
+    await runHook({ HIVEMIND_ORG_ID: "env-org", HIVEMIND_WORKSPACE_ID: undefined });
+    expect(banner()).toContain("org: env-org");
+    expect(banner()).not.toContain("routed-org");
+    expect(banner()).toContain("workspace: routed-ws");
   });
 });

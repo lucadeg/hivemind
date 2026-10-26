@@ -1,4 +1,16 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+// Hermetic: no embed daemon round-trips from the /docs/find query embedder.
+vi.mock("../../src/docs/embed.js", () => ({
+  makeDocEmbedder: () => async () => null,
+  makeQueryEmbedder: () => async () => null,
+}));
+// Local session event cache: default to a miss (null) so every existing test
+// exercises the DB read path unchanged. Individual tests override the return
+// value to exercise the cache-first path.
+const readSessionEventCacheMock = vi.fn<(sessionId: string) => string[] | null>(() => null);
+vi.mock("../../src/hooks/session-event-cache.js", () => ({
+  readSessionEventCache: (sessionId: string) => readSessionEventCacheMock(sessionId),
+}));
 import { DeeplakeFs, guessMime } from "../../src/shell/deeplake-fs.js";
 
 // ── Mock ManagedClient ────────────────────────────────────────────────────────
@@ -222,6 +234,120 @@ async function makeFs(seed: Record<string, string | Buffer> = {}, mount = "/memo
   return { fs, client };
 }
 
+// ── goal namespace isolation from the generic memory table ────────────────────
+// Regression for the VFS↔goals-table version skew: pre-routing hook versions
+// (<=0.7.4) wrote goals as plain files into the generic memory table. The
+// bootstrap must NOT re-surface those goal-shaped memory rows into the VFS goal
+// namespace when the dedicated hivemind_goals table is configured, or a goal is
+// visible in `ls /goal/...` yet absent from `hivemind goal list`.
+function makeSkewClient(opts: {
+  memoryPaths: string[];
+  goals: Array<{ goal_id: string; owner: string; status: string; content: string }>;
+}) {
+  return {
+    applyStorageCreds: vi.fn().mockResolvedValue(undefined),
+    ensureTable: vi.fn().mockResolvedValue(undefined),
+    ensureGoalsTable: vi.fn().mockResolvedValue(undefined),
+    listTables: vi.fn().mockResolvedValue(["memory", "goals"]),
+    query: vi.fn().mockImplementation(async (sql: string) => {
+      if (sql.includes("SELECT path, size_bytes, mime_type")) {
+        return opts.memoryPaths.map(p => ({ path: p, size_bytes: 1, mime_type: "text/markdown" }));
+      }
+      if (sql.includes("SELECT goal_id, owner, status, content")) {
+        return opts.goals.map(g => ({ ...g, created_at: "2026-01-01" }));
+      }
+      return [];
+    }),
+  };
+}
+
+describe("DeeplakeFs goal namespace isolation", () => {
+  it("excludes legacy goal-shaped rows from the memory table when goalsTable is set", async () => {
+    const client = makeSkewClient({
+      // Legacy phantom goal written to the generic memory table by the old hook,
+      // plus a normal memory note that must be preserved.
+      memoryPaths: ["/goal/alice/opened/legacy.md", "/notes/hello.md"],
+      // The real goal lives in the structured table.
+      goals: [{ goal_id: "real", owner: "alice", status: "opened", content: "real goal" }],
+    });
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions", {
+      goalsTable: "goals",
+    });
+    const opened = await fs.readdir("/goal/alice/opened");
+    expect(opened).toContain("real.md");        // structured goal surfaces
+    expect(opened).not.toContain("legacy.md");  // phantom memory-table goal is hidden
+    expect(await fs.readdir("/notes")).toContain("hello.md"); // normal memory untouched
+  });
+
+  it("keeps goal-shaped memory rows when goalsTable is NOT configured (routing off)", async () => {
+    const client = makeSkewClient({
+      memoryPaths: ["/goal/alice/opened/legacy.md"],
+      goals: [],
+    });
+    const fs = await DeeplakeFs.create(client as never, "memory", "/");
+    // No dedicated table → the memory-table copy is the only one, keep it.
+    expect(await fs.readdir("/goal/alice/opened")).toContain("legacy.md");
+  });
+
+  it("preserves created_at on a status transition, recording the move in updated_at", async () => {
+    const sql: string[] = [];
+    const client = {
+      applyStorageCreds: vi.fn().mockResolvedValue(undefined),
+      ensureTable: vi.fn().mockResolvedValue(undefined),
+      ensureGoalsTable: vi.fn().mockResolvedValue(undefined),
+        listTables: vi.fn().mockResolvedValue(["memory", "goals"]),
+      query: vi.fn().mockImplementation(async (q: string) => {
+        sql.push(q);
+        if (q.includes("SELECT path, size_bytes, mime_type")) return [];
+        if (q.includes("SELECT goal_id, owner, status, content")) {
+          return [{ goal_id: "g1", owner: "alice", status: "opened", content: "do it", created_at: "2026-01-01" }];
+        }
+        // upsertGoalRow existence check → row exists, take the UPDATE branch.
+        if (q.startsWith("SELECT id FROM")) return [{ id: "row-1" }];
+        return [];
+      }),
+    };
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions", {
+      goalsTable: "goals",
+    });
+
+    await fs.mv("/goal/alice/opened/g1.md", "/goal/alice/closed/g1.md");
+
+    const update = sql.find(q => q.includes("UPDATE") && q.includes("status = 'closed'"));
+    expect(update).toBeDefined();
+    expect(update).toContain("updated_at =");   // edit time recorded here
+    expect(update).not.toContain("created_at ="); // creation time left untouched
+  });
+
+  it("keeps created_at and updated_at independent on a fresh goal INSERT", async () => {
+    const sql: string[] = [];
+    const client = {
+      applyStorageCreds: vi.fn().mockResolvedValue(undefined),
+      ensureTable: vi.fn().mockResolvedValue(undefined),
+      ensureGoalsTable: vi.fn().mockResolvedValue(undefined),
+        listTables: vi.fn().mockResolvedValue(["memory", "goals"]),
+      query: vi.fn().mockImplementation(async (q: string) => {
+        sql.push(q);
+        // upsertGoalRow existence check → no row, take the INSERT branch.
+        return [];
+      }),
+    };
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions", {
+      goalsTable: "goals",
+    });
+
+    await fs.writeFileWithMeta("/goal/alice/opened/g2.md", "do it later", {
+      creationDate: "2026-01-01T00:00:00.000Z",
+      lastUpdateDate: "2026-02-02T00:00:00.000Z",
+    });
+    await fs.flush();
+
+    const insert = sql.find(q => q.startsWith("INSERT") && q.includes('"goals"'));
+    expect(insert).toBeDefined();
+    expect(insert).toContain("'2026-01-01T00:00:00.000Z'"); // created_at
+    expect(insert).toContain("'2026-02-02T00:00:00.000Z'"); // updated_at — distinct, not clobbered
+  });
+});
 
 describe("guessMime", () => {
   it("returns application/json for .json", () => expect(guessMime("foo.json")).toBe("application/json"));
@@ -665,6 +791,191 @@ describe("prefetch", () => {
   });
 });
 
+// ── Session reads: bodyless rows must not read as silent empty files ─────────
+describe("readFile: session bodies", () => {
+  function makeSessionsFs(messages: unknown[]) {
+    const path = "/sessions/alice/a.json";
+    const client = {
+      ensureTable: vi.fn().mockResolvedValue(undefined),
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("SELECT path, size_bytes, mime_type")) return [];
+        if (sql.includes("SELECT path, MAX(size_bytes) as total_size")) {
+          // size_bytes is populated even when the body is empty — this is the
+          // exact "ls shows a size, cat shows nothing" split being tested.
+          return [{ path, total_size: 30295 }];
+        }
+        if (sql.includes("SELECT message FROM")) {
+          return messages.map((message) => ({ message }));
+        }
+        return [];
+      }),
+    };
+    return { path, client };
+  }
+
+  it("returns an empty-body notice (not 0 bytes) when all message rows are NULL", async () => {
+    const { path, client } = makeSessionsFs([null, null]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    const text = await fs.readFile(path);
+
+    expect(text).not.toBe("");
+    expect(text).toContain("2 stored rows");
+    expect(text).toContain("message body is empty");
+  });
+
+  it("does not leak the literal string 'null' or 'undefined' into content", async () => {
+    const { path, client } = makeSessionsFs([null, undefined]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    const text = await fs.readFile(path);
+
+    expect(text).not.toContain("null");
+    expect(text).not.toContain("undefined");
+  });
+
+  it("readFileBuffer also emits the notice for empty-string bodies", async () => {
+    const { path, client } = makeSessionsFs(["", ""]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    const buf = await fs.readFileBuffer(path);
+
+    expect(Buffer.from(buf).toString("utf-8")).toContain("message body is empty");
+  });
+
+  it("keeps only real turns when a session mixes empty and populated bodies", async () => {
+    const { path, client } = makeSessionsFs([
+      "",
+      "{\"type\":\"user_message\",\"content\":\"hello\"}",
+      null,
+      "{\"type\":\"assistant_message\",\"content\":\"hi\"}",
+    ]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    const text = await fs.readFile(path);
+
+    expect(text).toBe("[user] hello\n[assistant] hi");
+  });
+});
+
+// ── Session reads: local event cache is preferred over the fat DB read ───────
+describe("readFile: session local-cache-first", () => {
+  const SID = "019e2d5c-fec2-72d1-81f8-4edf525479b8";
+  // buildSessionPath shape: /sessions/<user>/<user>_<org>_<ws>_<sessionId>.jsonl
+  const PATH = `/sessions/ivo/ivo_Alka_default_${SID}.jsonl`;
+
+  // A client that knows PATH as a session and, on the fat `SELECT message`
+  // read, returns `dbMessages`. Tracks whether that fat read was issued.
+  function makeFs(dbMessages: unknown[]) {
+    let fatRead = 0;
+    const client = {
+      ensureTable: vi.fn().mockResolvedValue(undefined),
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("SELECT path, MAX(size_bytes) as total_size")) {
+          return [{ path: PATH, total_size: 4096 }];
+        }
+        if (sql.includes("SELECT message FROM")) {
+          fatRead++;
+          return dbMessages.map((message) => ({ message }));
+        }
+        return [];
+      }),
+    };
+    return { client, fatRead: () => fatRead };
+  }
+
+  beforeEach(() => {
+    readSessionEventCacheMock.mockReset();
+    readSessionEventCacheMock.mockReturnValue(null);
+  });
+
+  it("serves a session from the local cache without hitting the fat DB read", async () => {
+    readSessionEventCacheMock.mockReturnValue([
+      "{\"type\":\"user_message\",\"content\":\"hello\"}",
+      "{\"type\":\"assistant_message\",\"content\":\"hi\"}",
+    ]);
+    const { client, fatRead } = makeFs([/* DB should never be consulted */]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    const text = await fs.readFile(PATH);
+
+    expect(readSessionEventCacheMock).toHaveBeenCalledWith(SID);
+    expect(text).toBe("[user] hello\n[assistant] hi");
+    expect(fatRead()).toBe(0); // no `SELECT message` fat read
+  });
+
+  it("produces identical content from cache lines and from DB rows", async () => {
+    const events = [
+      "{\"type\":\"user_message\",\"content\":\"hello\"}",
+      "{\"type\":\"assistant_message\",\"content\":\"hi\"}",
+    ];
+    // DB path (cache miss)
+    const a = makeFs(events);
+    const fsDb = await DeeplakeFs.create(a.client as never, "memory", "/", "sessions");
+    const fromDb = await fsDb.readFile(PATH);
+    // Cache path (same rows served locally)
+    readSessionEventCacheMock.mockReturnValue(events);
+    const b = makeFs([]);
+    const fsCache = await DeeplakeFs.create(b.client as never, "memory", "/", "sessions");
+    const fromCache = await fsCache.readFile(PATH);
+
+    expect(fromCache).toBe(fromDb);
+    expect(a.fatRead()).toBe(1);
+    expect(b.fatRead()).toBe(0);
+  });
+
+  it("falls back to the DB read when the cache misses (null)", async () => {
+    readSessionEventCacheMock.mockReturnValue(null);
+    const { client, fatRead } = makeFs(["{\"type\":\"user_message\",\"content\":\"bye\"}"]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    const text = await fs.readFile(PATH);
+
+    expect(text).toBe("[user] bye");
+    expect(fatRead()).toBe(1);
+  });
+
+  it("falls back to the DB read when the cache is present but empty", async () => {
+    readSessionEventCacheMock.mockReturnValue([]);
+    const { client, fatRead } = makeFs(["{\"type\":\"user_message\",\"content\":\"bye\"}"]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    await fs.readFile(PATH);
+
+    expect(fatRead()).toBe(1);
+  });
+
+  it("readFileBuffer also prefers the local cache", async () => {
+    readSessionEventCacheMock.mockReturnValue(["{\"type\":\"user_message\",\"content\":\"hello\"}"]);
+    const { client, fatRead } = makeFs([]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    const buf = await fs.readFileBuffer(PATH);
+
+    expect(Buffer.from(buf).toString("utf-8")).toBe("[user] hello");
+    expect(fatRead()).toBe(0);
+  });
+
+  it("recovers the sessionId even when user/org/workspace contain underscores", async () => {
+    const path = `/sessions/my_user/my_user_my_org_my_ws_${SID}.jsonl`;
+    const client = {
+      ensureTable: vi.fn().mockResolvedValue(undefined),
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("SELECT path, MAX(size_bytes) as total_size")) {
+          return [{ path, total_size: 10 }];
+        }
+        return [];
+      }),
+    };
+    readSessionEventCacheMock.mockReturnValue(["{\"type\":\"user_message\",\"content\":\"hi\"}"]);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions");
+
+    await fs.readFile(path);
+
+    expect(readSessionEventCacheMock).toHaveBeenCalledWith(SID);
+  });
+});
+
 // ── Upsert: id stability & dates ─────────────────────────────────────────────
 describe("flush upsert", () => {
   it("INSERT for new file sets id, creation_date and last_update_date", async () => {
@@ -1018,5 +1329,61 @@ describe("cp recursive", () => {
     expect(await fs.readFile("/memory/dst/b.txt")).toBe("bbb");
     // Source still exists
     expect(await fs.readFile("/memory/src/a.txt")).toBe("aaa");
+  });
+});
+
+// ── docs VFS bridge (the shell path used by codex/cursor/hermes/interactive) ──
+
+describe("docs VFS routing in the shell", () => {
+  function makeDocsClient(onQuery: (sql: string) => unknown[]) {
+    return {
+      query: vi.fn(async (sql: string) => onQuery(sql)),
+      ensureTable: async () => {},
+      ensureGoalsTable: async () => {},
+    };
+  }
+
+  it("routes cat /docs/find/<q> to the DOCS table (not the memory read)", async () => {
+    const calls: string[] = [];
+    const client = makeDocsClient((sql) => {
+      calls.push(sql);
+      if (/FROM "hivemind_docs"/.test(sql)) return [{ path: "src/utils/sql.ts", content: "# sql.ts\nescaping helpers" }];
+      return [];
+    });
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions", { docsTable: "hivemind_docs" });
+    const out = await fs.readFile("/docs/find/injection");
+    expect(out).toContain("src/utils/sql.ts");            // rendered the doc hit
+    expect(calls.some((s) => /FROM "hivemind_docs"/.test(s))).toBe(true);  // queried docs table
+  });
+
+  it("readdir/readdirWithFileTypes synthesize /docs with correct dirent types", async () => {
+    const client = makeDocsClient(() => []);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions", { docsTable: "hivemind_docs" });
+    expect(await fs.readdir("/docs")).toEqual(["index.md", "find"]);
+    expect(await fs.readdir("/docs/find")).toEqual([]);
+    const root = await fs.readdir("/");
+    expect(root).toContain("docs");
+    const dirents = await fs.readdirWithFileTypes("/docs");
+    expect(dirents.find((d) => d.name === "find")?.isDirectory).toBe(true);
+    expect(dirents.find((d) => d.name === "index.md")?.isFile).toBe(true);
+    // Feature off (no docsTable): /docs is not synthesized anywhere.
+    const off = await DeeplakeFs.create(client as never, "memory", "/");
+    expect(await off.readdir("/")).not.toContain("docs");
+    await expect(off.readdir("/docs")).rejects.toMatchObject({ code: "ENOTDIR" });
+  });
+
+  it("a bare /docs directory read throws EISDIR; a missing leaf throws ENOENT", async () => {
+    const client = makeDocsClient(() => []);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/", "sessions", { docsTable: "hivemind_docs" });
+    await expect(fs.readFile("/docs")).rejects.toMatchObject({ code: "EISDIR" });
+    // Leaf doc that does not exist → the handler's not-found maps to ENOENT.
+    await expect(fs.readFile("/docs/no/such/file.ts.md")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does NOT route /docs when docsTable is unset (feature off)", async () => {
+    const client = makeDocsClient(() => []);
+    const fs = await DeeplakeFs.create(client as never, "memory", "/");
+    // No docsTable → /docs/find falls through to the generic memory read → ENOENT.
+    await expect(fs.readFile("/docs/find/x")).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

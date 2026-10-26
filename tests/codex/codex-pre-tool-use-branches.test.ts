@@ -14,7 +14,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildUnsupportedGuidance,
   processCodexPreToolUse,
-  runVirtualShell,
 } from "../../src/hooks/codex/pre-tool-use.js";
 
 const BASE_CONFIG = {
@@ -41,7 +40,6 @@ function baseDeps(extra: Record<string, any> = {}) {
     createApi: vi.fn(() => makeApi()),
     readCachedIndexContentFn: vi.fn(() => null) as any,
     writeCachedIndexContentFn: vi.fn() as any,
-    runVirtualShellFn: vi.fn(() => "") as any,
     logFn: vi.fn(),
     ...extra,
   };
@@ -67,13 +65,6 @@ describe("codex: pure helpers", () => {
     expect(s).toMatch(/python|node|curl/);
   });
 
-  it("runVirtualShell returns empty string and calls logFn when the spawn fails", () => {
-    const logFn = vi.fn();
-    // /nope is not executable → execFileSync throws, caught by the wrapper.
-    const out = runVirtualShell("cat /x", "/nope", logFn);
-    expect(out).toBe("");
-    expect(logFn).toHaveBeenCalledWith(expect.stringContaining("virtual shell failed"));
-  });
 });
 
 describe("processCodexPreToolUse: pass-through + unsafe", () => {
@@ -85,38 +76,42 @@ describe("processCodexPreToolUse: pass-through + unsafe", () => {
     expect(d.action).toBe("pass");
   });
 
-  it("returns `guide` with the unsupported-command guidance when a memory-path command uses an interpreter", async () => {
+  it("blocks (not `guide`) the unsafe command when a memory-path command uses an interpreter", async () => {
+    // "guide" exits 0 and would let Codex run python on the host; must block.
     const d = await processCodexPreToolUse(
       toolInput("python ~/.deeplake/memory/x.py"),
       baseDeps(),
     );
-    expect(d.action).toBe("guide");
+    expect(d.action).toBe("block");
     expect(d.output).toContain("not supported");
     expect(d.rewrittenCommand).toContain("python");
   });
 
-  it("falls back to runVirtualShell when no config is loaded", async () => {
-    const runVirtualShellFn = vi.fn(() => "FROM-SHELL") as any;
+  it("blocks (does NOT run a shell or proceed to host) when no config is loaded", async () => {
+    // Must be "block" (exit 2), not "guide" (exit 0): guide would let Codex run
+    // the original command on the host. Block stops it and injects guidance.
     const d = await processCodexPreToolUse(
       toolInput("cat ~/.deeplake/memory/index.md"),
-      { ...baseDeps({ runVirtualShellFn }), config: null as any },
+      { ...baseDeps(), config: null as any },
     );
     expect(d.action).toBe("block");
-    expect(d.output).toBe("FROM-SHELL");
-    expect(runVirtualShellFn).toHaveBeenCalledTimes(1);
+    expect(d.output).toContain("not supported");
   });
 
-  it("falls back to the virtual shell's empty-result placeholder when the shell returns empty", async () => {
-    const runVirtualShellFn = vi.fn(() => "") as any;
+  it("blocks with a not-found result (not generic guidance) for a concrete cat on a missing VFS file", async () => {
     const d = await processCodexPreToolUse(
       toolInput("cat ~/.deeplake/memory/nonexistent.md"),
       {
-        ...baseDeps({ runVirtualShellFn }),
+        ...baseDeps(),
         executeCompiledBashCommandFn: vi.fn(async () => null) as any,
         readVirtualPathContentFn: vi.fn(async () => null) as any,
       },
     );
-    expect(d.output).toContain("Command returned empty or the file does not exist");
+    expect(d.action).toBe("block");
+    expect(d.output).toContain("No such file or directory");
+    // Path-specific, not a generic error (a regression to generic text must fail).
+    expect(d.output).toContain("nonexistent.md");
+    expect(d.output).not.toContain("not supported");
   });
 });
 
@@ -411,17 +406,252 @@ describe("processCodexPreToolUse: find + grep + fallback", () => {
     expect(handleGrepDirectFn).toHaveBeenCalled();
   });
 
-  it("falls back to runVirtualShell when the direct-query path throws mid-flow", async () => {
-    const runVirtualShellFn = vi.fn(() => "SHELL OK") as any;
+  it("blocks (does NOT run a shell or proceed to host) when the direct-query path throws mid-flow", async () => {
     const d = await processCodexPreToolUse(
       toolInput("cat ~/.deeplake/memory/sessions/a.json"),
       {
-        ...baseDeps({ runVirtualShellFn }),
+        ...baseDeps(),
         executeCompiledBashCommandFn: vi.fn(async () => null) as any,
         readVirtualPathContentFn: vi.fn(async () => { throw new Error("network bonk"); }) as any,
       },
     );
-    expect(d.output).toBe("SHELL OK");
-    expect(runVirtualShellFn).toHaveBeenCalled();
+    expect(d.action).toBe("block");
+    expect(d.output).toContain("not supported");
+  });
+});
+
+describe("processCodexPreToolUse: memory write redirect (F3 — no double execution)", () => {
+  const writeCmd = "echo 'hello' > ~/.deeplake/memory/h2h/relay-codex.md";
+
+  function writeDeps(extra: Record<string, any> = {}) {
+    return {
+      ...baseDeps(extra),
+      // Writes are not compiled reads — force the inline fast-path to miss so the
+      // command reaches the VFS-shell fallback (the real production behavior).
+      executeCompiledBashCommandFn: vi.fn(async () => null) as any,
+    };
+  }
+
+  it("a successful VFS write returns action=allow with a rewritten host command, NOT guide/pass", async () => {
+    const runVfsShellFn = vi.fn(() => ({ status: 0, stdout: "(done)" }));
+    const d = await processCodexPreToolUse(toolInput(writeCmd), writeDeps({ runVfsShellFn }));
+
+    // allow ⇒ main() emits permissionDecision:allow + updatedInput so Codex runs
+    // the REPLACEMENT, not the original. pass/guide would let the original redirect
+    // re-run on the host (the F3 "No such file or directory" double execution).
+    expect(d.action).toBe("allow");
+    expect(d.action).not.toBe("pass");
+    expect(runVfsShellFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("the replacement command echoes the VFS result and never re-runs the original redirect", async () => {
+    const runVfsShellFn = vi.fn(() => ({ status: 0, stdout: "(done)" }));
+    const d = await processCodexPreToolUse(toolInput(writeCmd), writeDeps({ runVfsShellFn }));
+
+    expect(d.replacementCommand).toBe("printf '%s\\n' '(done)'");
+    // Negative assertions: the host must NOT re-execute the write. The rewrite
+    // must contain neither a redirect operator nor the memory path.
+    expect(d.replacementCommand).not.toMatch(/>/);
+    expect(d.replacementCommand).not.toContain(".deeplake/memory");
+  });
+
+  it("POSIX-escapes single quotes in the VFS output so it can't break out of the rewrite", async () => {
+    const runVfsShellFn = vi.fn(() => ({ status: 0, stdout: "it's done" }));
+    const d = await processCodexPreToolUse(toolInput(writeCmd), writeDeps({ runVfsShellFn }));
+
+    expect(d.action).toBe("allow");
+    expect(d.replacementCommand).toBe(`printf '%s\\n' 'it'\\''s done'`);
+  });
+
+  it("treats a no-space redirect (echo foo>file) as a write → allow, not block", async () => {
+    // CodeRabbit #284: `/\s>>?\s/` missed `echo foo>file`, misrouting it to block
+    // and re-surfacing the F3 "write looks failed" symptom. The relaxed guard
+    // must recognize the redirect regardless of surrounding whitespace.
+    const runVfsShellFn = vi.fn(() => ({ status: 0, stdout: "(done)" }));
+    const d = await processCodexPreToolUse(
+      toolInput("echo 'hello'>~/.deeplake/memory/h2h/relay-codex.md"),
+      writeDeps({ runVfsShellFn }),
+    );
+    expect(d.action).toBe("allow");
+    expect(d.replacementCommand).toBe("printf '%s\\n' '(done)'");
+  });
+
+  it("does NOT treat an fd redirect (echo ... 2>file) as a write → stays block", async () => {
+    // `2>`/`&>` are file-descriptor redirects, not memory writes. The `[^0-9&>]`
+    // guard must keep them on the block path (no allow rewrite).
+    const runVfsShellFn = vi.fn(() => ({ status: 0, stdout: "x" }));
+    const d = await processCodexPreToolUse(
+      toolInput("echo hello 2>~/.deeplake/memory/h2h/err.md"),
+      writeDeps({ runVfsShellFn }),
+    );
+    expect(d.action).toBe("block");
+    expect(d.replacementCommand).toBeUndefined();
+  });
+
+  it("falls back to block+guidance when the VFS shell fails (non-zero, no stdout)", async () => {
+    const runVfsShellFn = vi.fn(() => ({ status: 1, stdout: "" }));
+    const d = await processCodexPreToolUse(toolInput(writeCmd), writeDeps({ runVfsShellFn }));
+
+    expect(d.action).toBe("block");
+    expect(d.output).toContain("not supported");
+    expect(d.replacementCommand).toBeUndefined();
+  });
+});
+
+describe("processCodexPreToolUse: ls / find variants + fallback branches", () => {
+  const noCompiled = () => ({ executeCompiledBashCommandFn: vi.fn(async () => null) as any });
+
+  it("ls -l lists files and subdirs in long format, skipping rows outside the dir", async () => {
+    const listVirtualPathRowsFn = vi.fn(async () => [
+      { path: "/sessions/a.json", size_bytes: 42 },
+      { path: "/sessions/sub/b.json", size_bytes: 10 }, // nested → directory entry
+      { path: "/other/z.json", size_bytes: 5 },          // outside /sessions → skipped
+    ]) as any;
+    const d = await processCodexPreToolUse(
+      toolInput("ls -l ~/.deeplake/memory/sessions"),
+      { ...baseDeps({ listVirtualPathRowsFn }), ...noCompiled() },
+    );
+    expect(d.action).toBe("block");
+    expect(d.output).toContain("a.json");
+    expect(d.output).toContain("sub/");      // nested path collapses to a dir entry
+    expect(d.output).toMatch(/drwx/);        // long-format directory line
+    expect(d.output).toMatch(/-rw/);         // long-format file line
+    expect(d.output).not.toContain("z.json"); // row outside the prefix is dropped
+  });
+
+  it("ls / (mount root) lists top-level entries", async () => {
+    const listVirtualPathRowsFn = vi.fn(async () => [
+      { path: "/sessions/a.json", size_bytes: 1 },
+      { path: "/index.md", size_bytes: 2 },
+    ]) as any;
+    const d = await processCodexPreToolUse(
+      toolInput("ls ~/.deeplake/memory"),
+      { ...baseDeps({ listVirtualPathRowsFn }), ...noCompiled() },
+    );
+    expect(d.action).toBe("block");
+    expect(d.output).toContain("sessions/");
+    expect(d.output).toContain("index.md");
+  });
+
+  it("ls on an unknown dir returns 'cannot access'", async () => {
+    const d = await processCodexPreToolUse(
+      toolInput("ls ~/.deeplake/memory/nope"),
+      { ...baseDeps({ listVirtualPathRowsFn: vi.fn(async () => []) as any }), ...noCompiled() },
+    );
+    expect(d.action).toBe("block");
+    expect(d.output).toContain("cannot access");
+  });
+
+  it("find -name with a double-quoted pattern resolves matches", async () => {
+    const d = await processCodexPreToolUse(
+      toolInput('find ~/.deeplake/memory/sessions -name "*.md"'),
+      { ...baseDeps({ findVirtualPathsFn: vi.fn(async () => ["/sessions/a.md"]) as any }), ...noCompiled() },
+    );
+    expect(d.output).toBe("/sessions/a.md");
+  });
+
+  it("find -name with an unquoted pattern resolves matches", async () => {
+    const d = await processCodexPreToolUse(
+      toolInput("find ~/.deeplake/memory/sessions -name *.md"),
+      { ...baseDeps({ findVirtualPathsFn: vi.fn(async () => ["/sessions/b.md"]) as any }), ...noCompiled() },
+    );
+    expect(d.output).toBe("/sessions/b.md");
+  });
+
+  it("find rooted at the mount (/) normalizes the dir argument to '/'", async () => {
+    const findVirtualPathsFn = vi.fn(async () => ["/x.json"]) as any;
+    const d = await processCodexPreToolUse(
+      toolInput("find ~/.deeplake/memory -name '*.json'"),
+      { ...baseDeps({ findVirtualPathsFn }), ...noCompiled() },
+    );
+    expect(d.output).toBe("/x.json");
+    expect(findVirtualPathsFn).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), expect.anything(), "/", expect.anything(),
+    );
+  });
+
+  it("a non-redirect echo handled by the VFS shell stays on block (not allow)", async () => {
+    const runVfsShellFn = vi.fn(() => ({ status: 0, stdout: "echoed" }));
+    const d = await processCodexPreToolUse(
+      toolInput("echo hello ~/.deeplake/memory/note.txt"),
+      { ...baseDeps(), ...noCompiled(), runVfsShellFn },
+    );
+    expect(d.action).toBe("block");
+    expect(d.output).toBe("echoed");
+    expect(d.replacementCommand).toBeUndefined();
+  });
+
+  it("a write succeeds via stdout even when the VFS shell exits non-zero", async () => {
+    const runVfsShellFn = vi.fn(() => ({ status: 1, stdout: "still wrote" }));
+    const d = await processCodexPreToolUse(
+      toolInput("echo 'x' > ~/.deeplake/memory/h2h/a.md"),
+      { ...baseDeps(), ...noCompiled(), runVfsShellFn },
+    );
+    expect(d.action).toBe("allow");
+    expect(d.replacementCommand).toBe("printf '%s\\n' 'still wrote'");
+  });
+
+  it("a write with empty stdout defaults the echoed result to (done)", async () => {
+    const runVfsShellFn = vi.fn(() => ({ status: 0, stdout: "" }));
+    const d = await processCodexPreToolUse(
+      toolInput("echo 'x' > ~/.deeplake/memory/h2h/a.md"),
+      { ...baseDeps(), ...noCompiled(), runVfsShellFn },
+    );
+    expect(d.action).toBe("allow");
+    expect(d.replacementCommand).toBe("printf '%s\\n' '(done)'");
+  });
+
+  it("a /graph read is answered from the local snapshot (block + body), before any SQL", async () => {
+    const tryGraphReadFn = vi.fn(() => "GRAPH SNAPSHOT BODY") as any;
+    const executeCompiledBashCommandFn = vi.fn(async () => "SHOULD-NOT-RUN") as any;
+    const d = await processCodexPreToolUse(
+      toolInput("cat ~/.deeplake/memory/graph/index.md"),
+      { ...baseDeps({ tryGraphReadFn }), executeCompiledBashCommandFn },
+    );
+    expect(d.action).toBe("block");
+    expect(d.output).toBe("GRAPH SNAPSHOT BODY");
+    expect(executeCompiledBashCommandFn).not.toHaveBeenCalled(); // graph short-circuits before SQL
+  });
+
+  it("ls /docs renders the docs root index (not the memory listing), project-scoped", async () => {
+    const calls: string[] = [];
+    const api = { query: vi.fn(async (sql: string) => { calls.push(sql); return []; }) } as any;
+    const d = await processCodexPreToolUse(
+      toolInput("ls ~/.deeplake/memory/docs") as any,
+      baseDeps({ createApi: vi.fn(() => api), config: { ...BASE_CONFIG, docsTableName: "hivemind_docs" } as any }),
+    );
+    expect(d.action).toBe("block");
+    expect(d.output).toContain("Docs Index");
+    expect(calls.some((c) => /hivemind_docs/.test(c))).toBe(true); // docs table, not memory
+  });
+
+  it("a cat of /docs/find is answered from the docs table, PROJECT-SCOPED to the cwd repo", async () => {
+    const calls: string[] = [];
+    const api = { query: vi.fn(async (sql: string) => { calls.push(sql); return [{ path: "src/a.ts", content: "# a" }]; }) } as any;
+    const d = await processCodexPreToolUse(
+      toolInput("cat ~/.deeplake/memory/docs/find/auth") as any,
+      baseDeps({ createApi: vi.fn(() => api), config: { ...BASE_CONFIG, docsTableName: "hivemind_docs" } as any }),
+    );
+    expect(d.action).toBe("block");
+    expect(d.output).toContain("src/a.ts");
+    // Shared-table safety: the search filters to this repo's project key,
+    // keeping legacy unstamped rows ('') visible.
+    expect(calls.some((c) => /\(project = '[0-9a-f]{16}' OR project = ''\)/.test(c))).toBe(true);
+  });
+
+  it("resolves a read using the DEFAULT createApi + log deps (no injection)", async () => {
+    // Omit createApi / logFn / cache deps so their default values run: the default
+    // createApi constructs a DeeplakeApi (no network at construction) and the
+    // module-level `log` executes. The injected read fn keeps it off the network.
+    const d = await processCodexPreToolUse(
+      toolInput("cat ~/.deeplake/memory/sessions/a.json"),
+      {
+        config: BASE_CONFIG as any,
+        executeCompiledBashCommandFn: vi.fn(async () => null) as any,
+        readVirtualPathContentFn: vi.fn(async () => "DEFAULT-DEPS-CONTENT") as any,
+      },
+    );
+    expect(d.action).toBe("block");
+    expect(d.output).toBe("DEFAULT-DEPS-CONTENT");
   });
 });

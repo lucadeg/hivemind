@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { renderNotifications } from "../../src/notifications/format.js";
-import { welcomeRule } from "../../src/notifications/rules/welcome.js";
 import {
   registerRule,
   listRules,
@@ -18,6 +17,7 @@ import { drainSessionStart } from "../../src/notifications/index.js";
 import { fetchBackendNotifications } from "../../src/notifications/sources/backend.js";
 import type { Notification, Rule } from "../../src/notifications/index.js";
 import type { Credentials } from "../../src/commands/auth-creds.js";
+import { setFakeHome, clearFakeHome } from "../shared/fake-home.js";
 
 /**
  * Targeted coverage tests for branches not exercised by the main
@@ -30,12 +30,12 @@ let ORIGINAL_HOME: string | undefined;
 beforeEach(() => {
   TEMP_HOME = mkdtempSync(join(tmpdir(), "hivemind-notif-cov-"));
   ORIGINAL_HOME = process.env.HOME;
-  process.env.HOME = TEMP_HOME;
+  setFakeHome(TEMP_HOME);
   _resetRulesForTest();
 });
 
 afterEach(() => {
-  process.env.HOME = ORIGINAL_HOME;
+  clearFakeHome();
   rmSync(TEMP_HOME, { recursive: true, force: true });
 });
 
@@ -58,71 +58,25 @@ describe("format — severity fallbacks", () => {
 });
 
 // ---------------------------------------------------------------------------
-// rules/welcome.ts: optional creds fields
-// ---------------------------------------------------------------------------
-
-describe("welcomeRule — optional creds fallbacks", () => {
-  const baseCreds: Credentials = {
-    token: "tok",
-    orgId: "org-only",
-    savedAt: "2026-05-06T00:00:00Z",
-  };
-
-  it("drops the comma-clause when userName is missing (no awkward 'there' fallback)", () => {
-    const result = welcomeRule.evaluate({
-      agent: "claude-code",
-      creds: { ...baseCreds, userName: undefined },
-      state: { shown: {} },
-    });
-    expect(result?.title).toBe("Welcome back");
-    expect(result?.title).not.toContain("there");
-    expect(result?.title).not.toContain(",");
-  });
-
-  it("falls back to 'your organization' when orgName is missing (does NOT expose orgId UUID)", () => {
-    const result = welcomeRule.evaluate({
-      agent: "claude-code",
-      creds: { ...baseCreds, orgName: undefined, userName: "u" },
-      state: { shown: {} },
-    });
-    expect(result?.body).toContain("your organization");
-    // Critical: must NOT leak the UUID-shaped orgId into user-facing text.
-    expect(result?.body).not.toContain(baseCreds.orgId);
-    expect(result?.body).not.toContain("undefined");
-  });
-
-  it("uses 'org <name>' phrasing when orgName is present", () => {
-    const result = welcomeRule.evaluate({
-      agent: "claude-code",
-      creds: { ...baseCreds, orgName: "acme", userName: "u" },
-      state: { shown: {} },
-    });
-    expect(result?.body).toContain("Connected to org acme");
-  });
-
-  it("falls back to 'default' workspace when workspaceId is missing", () => {
-    const result = welcomeRule.evaluate({
-      agent: "claude-code",
-      creds: { ...baseCreds, workspaceId: undefined, userName: "u" },
-      state: { shown: {} },
-    });
-    expect(result?.body).toContain("default");
-  });
-});
-
-// ---------------------------------------------------------------------------
 // rules/registry.ts: duplicate registration + trigger filtering
+// (Welcome rule's optional-field rendering moved to primary-banner tests.)
 // ---------------------------------------------------------------------------
 
 describe("rules registry — edge cases", () => {
+  const dummyRule: Rule = {
+    id: "dummy-test-rule",
+    trigger: "session_start",
+    evaluate: () => null,
+  };
+
   it("throws on duplicate rule id", () => {
-    registerRule(welcomeRule);
-    expect(() => registerRule(welcomeRule)).toThrow(/duplicate rule id/);
+    registerRule(dummyRule);
+    expect(() => registerRule(dummyRule)).toThrow(/duplicate rule id/);
   });
 
   it("listRules returns currently registered rules", () => {
     expect(listRules()).toHaveLength(0);
-    registerRule(welcomeRule);
+    registerRule(dummyRule);
     expect(listRules()).toHaveLength(1);
   });
 
@@ -155,21 +109,139 @@ describe("rules registry — edge cases", () => {
     });
     expect(out).toHaveLength(0);
   });
+
+  it("evaluateRules returns empty array when no rules are registered (for-loop branch)", () => {
+    // Coverage gap: without this case the for-loop in evaluateRules never
+    // exercises the empty-RULES branch — when _resetRulesForTest leaves the
+    // array empty, the loop body should never run and the function should
+    // return [].
+    const out = evaluateRules("session_start", {
+      agent: "claude-code",
+      creds: null,
+      state: { shown: {} },
+    });
+    expect(out).toEqual([]);
+  });
+
+  it("evaluateRules pushes truthy results onto the output array (covered branch)", () => {
+    // Coverage gap: the `if (result) out.push(result)` truthy branch on
+    // registry.ts:30. Other tests register rules that return null; this
+    // one returns a real Notification so the push runs.
+    const firingRule: Rule = {
+      id: "always-fires",
+      trigger: "session_start",
+      evaluate: () => ({ id: "always-fires", title: "T", body: "B", dedupKey: { v: 1 } }),
+    };
+    registerRule(firingRule);
+    const out = evaluateRules("session_start", {
+      agent: "claude-code",
+      creds: null,
+      state: { shown: {} },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("always-fires");
+  });
 });
 
 // ---------------------------------------------------------------------------
 // delivery/index.ts: empty-string short-circuit
 // ---------------------------------------------------------------------------
 
-describe("delivery dispatch — empty rendered short-circuit", () => {
-  it("emit() returns silently when rendered is empty string", () => {
+describe("delivery dispatch — empty short-circuit", () => {
+  it("emit() returns silently when notifications array is empty", () => {
+    // The dispatch now takes notifications (not a pre-rendered string)
+    // so per-agent adapters can split content per channel — see the
+    // model/user split in delivery/claude-code.ts. An empty list still
+    // short-circuits without writing anything to stdout.
     const writes: string[] = [];
     vi.spyOn(process.stdout, "write").mockImplementation((c: any) => {
       writes.push(typeof c === "string" ? c : c.toString());
       return true;
     });
-    emit("claude-code", "");
+    emit("claude-code", []);
     expect(writes).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
+  it("routes userVisibleOnly notifications to systemMessage ONLY, never to additionalContext (codex P1 guard)", () => {
+    // Security invariant: notifications carrying LLM-derived content
+    // set userVisibleOnly so their body never reaches the model's
+    // additionalContext channel. The user still sees the message in
+    // the terminal via systemMessage. Without this split an
+    // adversarial gate output could prompt-inject the next session.
+    const writes: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c: any) => {
+      writes.push(typeof c === "string" ? c : c.toString());
+      return true;
+    });
+    emit("claude-code", [
+      {
+        id: "user-only",
+        severity: "info",
+        title: "User-visible title",
+        body: "BODY-WITH-LLM-PROSE",
+        dedupKey: { x: 1 },
+        userVisibleOnly: true,
+      },
+    ]);
+    expect(writes).toHaveLength(1);
+    const payload = JSON.parse(writes[0]);
+    expect(payload.systemMessage).toContain("BODY-WITH-LLM-PROSE");
+    expect(payload.hookSpecificOutput.additionalContext).toBeUndefined();
+    vi.restoreAllMocks();
+  });
+
+  it("routes non-user-only notifications to BOTH channels (legacy behavior)", () => {
+    const writes: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c: any) => {
+      writes.push(typeof c === "string" ? c : c.toString());
+      return true;
+    });
+    emit("claude-code", [
+      {
+        id: "regular",
+        severity: "info",
+        title: "Static title",
+        body: "STATIC-BODY",
+        dedupKey: { x: 1 },
+      },
+    ]);
+    const payload = JSON.parse(writes[0]);
+    expect(payload.systemMessage).toContain("STATIC-BODY");
+    expect(payload.hookSpecificOutput.additionalContext).toContain("STATIC-BODY");
+    vi.restoreAllMocks();
+  });
+
+  it("emits a mixed batch correctly: only safe items reach additionalContext, all items reach systemMessage", () => {
+    const writes: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c: any) => {
+      writes.push(typeof c === "string" ? c : c.toString());
+      return true;
+    });
+    emit("claude-code", [
+      {
+        id: "safe",
+        severity: "info",
+        title: "Safe",
+        body: "STATIC-BODY",
+        dedupKey: { x: 1 },
+      },
+      {
+        id: "unsafe",
+        severity: "info",
+        title: "Unsafe",
+        body: "LLM-DERIVED",
+        dedupKey: { x: 2 },
+        userVisibleOnly: true,
+      },
+    ]);
+    const payload = JSON.parse(writes[0]);
+    // additionalContext (model channel) has ONLY the safe body
+    expect(payload.hookSpecificOutput.additionalContext).toContain("STATIC-BODY");
+    expect(payload.hookSpecificOutput.additionalContext).not.toContain("LLM-DERIVED");
+    // systemMessage (user channel) has BOTH
+    expect(payload.systemMessage).toContain("STATIC-BODY");
+    expect(payload.systemMessage).toContain("LLM-DERIVED");
     vi.restoreAllMocks();
   });
 });
@@ -317,7 +389,7 @@ describe("drainSessionStart — queue drained even when nothing fresh", () => {
     });
 
     const n: Notification = { id: "x", title: "T", body: "B", dedupKey: { v: 1 } };
-    enqueueNotification(n);
+    await enqueueNotification(n);
 
     // First drain: fires, marks as shown
     await drainSessionStart({ agent: "claude-code", creds: null });
@@ -325,7 +397,7 @@ describe("drainSessionStart — queue drained even when nothing fresh", () => {
     expect(readQueue().queue.length).toBe(0);
 
     // Re-enqueue same notification with same dedupKey → fresh.length === 0
-    enqueueNotification(n);
+    await enqueueNotification(n);
     expect(readQueue().queue.length).toBe(1);
 
     writes.length = 0;
@@ -348,7 +420,7 @@ describe("drainSessionStart — queue drained even when nothing fresh", () => {
     vi.spyOn(stateModule, "tryClaim").mockReturnValue(false);
 
     const n: Notification = { id: "y", title: "T2", body: "B2", dedupKey: { v: 99 } };
-    enqueueNotification(n);
+    await enqueueNotification(n);
     await drainSessionStart({ agent: "claude-code", creds: null });
     expect(writes.length).toBe(0);
     expect(readQueue().queue.length).toBe(0); // drained anyway

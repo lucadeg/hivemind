@@ -27,11 +27,15 @@
  */
 
 import { readStdin } from "../../utils/stdin.js";
-import { loadConfig } from "../../config.js";
+import { deriveProjectKey } from "../../utils/repo-identity.js";
+import { loadRoutedConfig, isHivemindEnabled } from "../../dir-config.js";
 import { DeeplakeApi } from "../../deeplake-api.js";
 import { log as _log } from "../../utils/debug.js";
 import { parseBashGrep, handleGrepDirect } from "../grep-direct.js";
 import { touchesMemory, rewritePaths } from "../memory-path-utils.js";
+import { tryGraphRead } from "../../graph/graph-command.js";
+import { tryDocsRead } from "../../docs/docs-command.js";
+import { makeQueryEmbedder } from "../../docs/embed.js";
 const log = (msg: string) => _log("cursor-pre-tool-use", msg);
 
 interface CursorShellToolInput {
@@ -50,6 +54,7 @@ interface CursorPreToolUseInput {
 
 async function main(): Promise<void> {
   const input = await readStdin<CursorPreToolUseInput>();
+  if (!isHivemindEnabled(input.cwd ?? input.workspace_roots?.[0] ?? process.cwd())) return; // .hivemind "collect": false → fully inactive
   if (input.tool_name !== "Shell") return; // only intercept Shell, not Read/Write/MCP
 
   const command = (input.tool_input as CursorShellToolInput | undefined)?.command;
@@ -60,10 +65,25 @@ async function main(): Promise<void> {
   // virtual mount root "/" before parsing — same step Claude / Codex run.
   const rewritten = rewritePaths(command);
 
-  const grepParams = parseBashGrep(rewritten);
-  if (!grepParams) return; // not a grep/rg invocation we can handle directly
+  // Graph VFS dispatch — a cat/head/tail/ls on the `/graph/*` subtree is
+  // answered from the local snapshot (synthesized text), no SQL, no disk.
+  // Must run BEFORE parseBashGrep: a `cat /graph/find/foo` isn't a grep and
+  // would otherwise fall through and leave Cursor blind to the graph (the
+  // exact gap that made Cursor silently lack graph queries). See
+  // src/graph/graph-command.ts (shared with the Claude Code intercept).
+  const graphBody = tryGraphRead(rewritten, input.cwd ?? process.cwd());
+  if (graphBody !== null) {
+    log(`graph vfs intercept: ${command.slice(0, 80)}`);
+    const echoCmd = `cat <<'__HIVEMIND_RESULT__'\n${graphBody}\n__HIVEMIND_RESULT__`;
+    process.stdout.write(JSON.stringify({
+      permission: "allow",
+      updated_input: { command: echoCmd },
+      agent_message: "[Hivemind graph]",
+    }));
+    return;
+  }
 
-  const config = loadConfig();
+  const config = loadRoutedConfig(input.cwd ?? process.cwd());
   if (!config) {
     log("no config — falling through to Cursor's bash");
     return;
@@ -76,6 +96,33 @@ async function main(): Promise<void> {
     config.workspaceId,
     config.tableName,
   );
+
+  // Docs VFS dispatch — a cat of /docs/* (browse or find/) answered from the
+  // docs table, same rewrite trick as the graph dispatch above. Runs before the
+  // grep parse so `cat /docs/find/x` (not a grep) isn't left to Cursor's host bash.
+  const docsTable = process.env["HIVEMIND_DOCS_TABLE"] ?? config.docsTableName;
+  // Fail OPEN like the grep path below: a throw here would crash the hook
+  // without a decision and let a memory-touching command reach the host shell.
+  let docsBody: string | null = null;
+  try {
+    docsBody = await tryDocsRead(rewritten, (sql) => api.query(sql), docsTable, { embedQuery: makeQueryEmbedder(), project: deriveProjectKey(input.cwd ?? process.cwd()).key });
+  } catch (err) {
+    log(`docs vfs failed: ${(err as Error).message}`);
+    docsBody = "(docs temporarily unavailable — try again)";
+  }
+  if (docsBody !== null) {
+    log(`docs vfs intercept: ${command.slice(0, 80)}`);
+    const echoCmd = `cat <<'__HIVEMIND_RESULT__'\n${docsBody}\n__HIVEMIND_RESULT__`;
+    process.stdout.write(JSON.stringify({
+      permission: "allow",
+      updated_input: { command: echoCmd },
+      agent_message: "[Hivemind docs]",
+    }));
+    return;
+  }
+
+  const grepParams = parseBashGrep(rewritten);
+  if (!grepParams) return; // not a grep/rg invocation we can handle directly
 
   try {
     const result = await handleGrepDirect(api, config.tableName, config.sessionsTableName, grepParams);

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, openSync, writeFileSync, writeSync, closeSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -85,7 +85,7 @@ describe("runUpdate — branches", () => {
     });
     expect(code).toBe(0);
     expect(stdoutText()).toContain("Update available: 1.2.3 → 1.3.0");
-    expect(stdoutText()).toContain("(dry-run) Would run: npm install -g @deeplake/hivemind@latest");
+    expect(stdoutText()).toContain("(dry-run) Would run: npm install -g @deeplake/hivemind@1.3.0");
     expect(stdoutText()).toContain("(dry-run) Would re-run: hivemind install --skip-auth");
     expect(spawn).not.toHaveBeenCalled();
   });
@@ -137,7 +137,7 @@ describe("runUpdate — branches", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it("npm-global: spawns 'npm install -g @latest' THEN 'hivemind install --skip-auth' (in that order, exactly once each)", async () => {
+  it("npm-global: spawns 'npm install -g @<pinned-version>' THEN 'hivemind install --skip-auth' (in that order, exactly once each)", async () => {
     const spawn = vi.fn();
     const code = await runUpdate({
       currentVersionOverride: "1.2.3",
@@ -147,7 +147,7 @@ describe("runUpdate — branches", () => {
     });
     expect(code).toBe(0);
     expect(spawn).toHaveBeenCalledTimes(2);
-    expect(spawn.mock.calls[0]).toEqual(["npm", ["install", "-g", "@deeplake/hivemind@latest"]]);
+    expect(spawn.mock.calls[0]).toEqual(["npm", ["install", "-g", "@deeplake/hivemind@1.3.0"]]);
     expect(spawn.mock.calls[1]).toEqual(["hivemind", ["install", "--skip-auth"]]);
     expect(stdoutText()).toContain("Updated to 1.3.0");
   });
@@ -165,6 +165,8 @@ describe("runUpdate — branches", () => {
     expect(code).toBe(1);
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(stderrText()).toContain("npm install failed: ENOENT");
+    // The manual-retry hint must also be pinned, not @latest.
+    expect(stderrText()).toContain("Try running it manually: npm install -g @deeplake/hivemind@1.3.0");
   });
 
   it("npm-global: returns 1 if the post-install agent refresh fails", async () => {
@@ -192,7 +194,7 @@ describe("runUpdate — branches", () => {
     });
     expect(code).toBe(0);
     expect(stdoutText()).toContain("npx @deeplake/hivemind@1.3.0 install");
-    expect(stdoutText()).toContain("npm install -g @deeplake/hivemind@latest");
+    expect(stdoutText()).toContain("npm install -g @deeplake/hivemind@1.3.0");
     expect(spawn).not.toHaveBeenCalled();
   });
 
@@ -263,7 +265,7 @@ describe("runUpdate — branches", () => {
     });
     expect(code).toBe(1);
     expect(stderrText()).toContain("Could not determine how hivemind was installed");
-    expect(stderrText()).toContain("npm install -g @deeplake/hivemind@latest");
+    expect(stderrText()).toContain("npm install -g @deeplake/hivemind@1.3.0");
     expect(spawn).not.toHaveBeenCalled();
   });
 });
@@ -377,7 +379,14 @@ describe("detectInstallKind — heuristics", () => {
   // realpathSync throws on a non-existent path → catch falls back to the
   // raw argv1. Covers the catch branch in the realpath wrapper.
   it("falls back to raw argv1 when realpath throws (path doesn't exist)", () => {
-    const fakePath = "/this/path/does/not/exist/_npx/x/node_modules/@deeplake/hivemind/bundle/cli.js";
+    // Build the path with the platform separator so the `${sep}_npx${sep}`
+    // pattern match in detectInstallKind fires on Windows too — a hardcoded
+    // forward-slash string never contains `\_npx\` on win32, mis-classifying
+    // it as "unknown".
+    const fakePath = join(
+      tmpdir(), "this", "path", "does", "not", "exist",
+      "_npx", "x", "node_modules", "@deeplake", "hivemind", "bundle", "cli.js",
+    );
     const got = detectInstallKind(fakePath);
     // Path-pattern checks still work against the raw string — should land
     // in npx (the path contains `_npx`).
@@ -467,5 +476,145 @@ describe("getLatestNpmVersion", () => {
     );
     expect(await getLatestNpmVersion()).toBeNull();
     fetchSpy.mockRestore();
+  });
+});
+
+/**
+ * Concurrency: regression guard for the "@deeplake/hivemind partial-install"
+ * incident — 3 concurrent `npm install -g @deeplake/hivemind@latest` racing
+ * on the same retired-backup path, ENOTEMPTY, partial install on disk, dead
+ * bin symlink, hivemind command-not-found.
+ *
+ * Root cause (verified 2026-05-19): SessionStart hooks fire `hivemind update`
+ * detached on every session start, twice per session (once from
+ * session-start.ts, once from session-start-setup.ts), and `runUpdate()` had
+ * no inter-process serialization despite the design comment in
+ * src/hooks/shared/autoupdate.ts:32-53 promising one. Multiple Claude Code
+ * sessions starting within the same second → multiple concurrent npm i -g
+ * runs → race.
+ *
+ * The fix: non-blocking O_EXCL pidfile lock around the npm-global branch of
+ * runUpdate(). Late-arriving callers exit 0 silently. Tests use
+ * `lockPathOverride` to point at a tmp lockfile per case (CLAUDE.md
+ * destructive-safety rule 2).
+ */
+describe("runUpdate — concurrency lock", () => {
+  let TMP = "";
+  let LOCK = "";
+  beforeEach(() => {
+    TMP = mkdtempSync(join(tmpdir(), "hivemind-update-lock-test-"));
+    LOCK = join(TMP, "hivemind-update.lock");
+  });
+  afterEach(() => {
+    rmSync(TMP, { recursive: true, force: true });
+  });
+
+  it("skips with exit 0 and does NOT spawn when an ALIVE holder already owns the lock", async () => {
+    // Pre-create the lock with the current test process's PID (definitely
+    // alive). The new runUpdate call must see it, refuse to proceed, and
+    // exit 0 without touching npm.
+    mkdirSync(TMP, { recursive: true });
+    const fd = openSync(LOCK, "wx", 0o600);
+    writeSync(fd, String(process.pid));
+    closeSync(fd);
+
+    const spawn = vi.fn();
+    const code = await runUpdate({
+      currentVersionOverride: "1.2.3",
+      latestVersionOverride: "1.3.0",
+      installKindOverride: { kind: "npm-global", installDir: "/x" },
+      lockPathOverride: LOCK,
+      spawn,
+    });
+    expect(code).toBe(0);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(stdoutText() + stderrText()).toMatch(/another.*update.*in.*flight|already.*running/i);
+    // The other holder's lockfile must remain untouched — we don't own it.
+    expect(existsSync(LOCK)).toBe(true);
+    expect(readFileSync(LOCK, "utf-8")).toBe(String(process.pid));
+  });
+
+  it("reclaims a STALE lock (dead PID), runs the update, releases the lock", async () => {
+    // PID 0x7FFFFFFF is well above /proc/sys/kernel/pid_max on Linux
+    // (4194304 = 0x400000) and is reserved on macOS — guaranteed not alive.
+    mkdirSync(TMP, { recursive: true });
+    const deadPid = 0x7FFFFFFF;
+    writeFileSync(LOCK, String(deadPid), { mode: 0o600 });
+
+    const spawn = vi.fn();
+    const code = await runUpdate({
+      currentVersionOverride: "1.2.3",
+      latestVersionOverride: "1.3.0",
+      installKindOverride: { kind: "npm-global", installDir: "/x" },
+      lockPathOverride: LOCK,
+      spawn,
+    });
+    expect(code).toBe(0);
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(spawn.mock.calls[0]).toEqual(["npm", ["install", "-g", "@deeplake/hivemind@1.3.0"]]);
+    expect(spawn.mock.calls[1]).toEqual(["hivemind", ["install", "--skip-auth"]]);
+    // Released on success.
+    expect(existsSync(LOCK)).toBe(false);
+  });
+
+  it("releases the lock on the SUCCESS path", async () => {
+    const spawn = vi.fn();
+    const code = await runUpdate({
+      currentVersionOverride: "1.2.3",
+      latestVersionOverride: "1.3.0",
+      installKindOverride: { kind: "npm-global", installDir: "/x" },
+      lockPathOverride: LOCK,
+      spawn,
+    });
+    expect(code).toBe(0);
+    expect(existsSync(LOCK)).toBe(false);
+  });
+
+  it("releases the lock when `npm install` throws", async () => {
+    const spawn = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === "npm") throw new Error("ENOTEMPTY");
+    });
+    const code = await runUpdate({
+      currentVersionOverride: "1.2.3",
+      latestVersionOverride: "1.3.0",
+      installKindOverride: { kind: "npm-global", installDir: "/x" },
+      lockPathOverride: LOCK,
+      spawn,
+    });
+    expect(code).toBe(1);
+    expect(existsSync(LOCK)).toBe(false);
+  });
+
+  it("releases the lock when the agent refresh throws", async () => {
+    const spawn = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === "hivemind") throw new Error("missing platforms");
+    });
+    const code = await runUpdate({
+      currentVersionOverride: "1.2.3",
+      latestVersionOverride: "1.3.0",
+      installKindOverride: { kind: "npm-global", installDir: "/x" },
+      lockPathOverride: LOCK,
+      spawn,
+    });
+    expect(code).toBe(1);
+    expect(existsSync(LOCK)).toBe(false);
+  });
+
+  it("the lock is NOT acquired for non-upgrade exit paths (up-to-date, registry-fail, npx, local-dev, unknown, dry-run)", async () => {
+    // CLAUDE.md rule 8: assert the bad pattern is NOT present in the
+    // captured side effects. Acquiring the global lock for a no-op path
+    // would let a misbehaving caller block real updaters.
+    const spawn = vi.fn();
+    for (const opts of [
+      { latestVersionOverride: "1.2.3", currentVersionOverride: "1.2.3" }, // up-to-date
+      { latestVersionOverride: null, currentVersionOverride: "1.2.3" },     // registry-fail
+      { latestVersionOverride: "1.3.0", currentVersionOverride: "1.2.3", installKindOverride: { kind: "npx" as const, installDir: "/x" } },
+      { latestVersionOverride: "1.3.0", currentVersionOverride: "1.2.3", installKindOverride: { kind: "local-dev" as const, installDir: "/x" } },
+      { latestVersionOverride: "1.3.0", currentVersionOverride: "1.2.3", installKindOverride: { kind: "unknown" as const, installDir: "/x" } },
+      { latestVersionOverride: "1.3.0", currentVersionOverride: "1.2.3", installKindOverride: { kind: "npm-global" as const, installDir: "/x" }, dryRun: true },
+    ]) {
+      await runUpdate({ ...opts, lockPathOverride: LOCK, spawn });
+      expect(existsSync(LOCK)).toBe(false);
+    }
   });
 });

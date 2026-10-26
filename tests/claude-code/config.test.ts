@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { join } from "node:path";
 
 /**
  * Source-level tests for src/config.ts — loadConfig() merges
@@ -33,6 +34,8 @@ vi.mock("node:os", async () => {
 const ENV_KEYS = [
   "HIVEMIND_TOKEN", "HIVEMIND_ORG_ID", "HIVEMIND_WORKSPACE_ID",
   "HIVEMIND_API_URL", "HIVEMIND_TABLE", "HIVEMIND_SESSIONS_TABLE",
+  "HIVEMIND_SKILLS_TABLE", "HIVEMIND_RULES_TABLE",
+  "HIVEMIND_TASKS_TABLE", "HIVEMIND_TASK_EVENTS_TABLE",
   "HIVEMIND_MEMORY_PATH",
 ];
 
@@ -75,7 +78,11 @@ describe("loadConfig — no credentials file", () => {
       apiUrl: "https://api.deeplake.ai",
       tableName: "memory",
       sessionsTableName: "sessions",
-      memoryPath: "/home/tester/.deeplake/memory",
+      skillsTableName: "skills",
+      rulesTableName: "hivemind_rules",
+      // Product builds this with path.join(homedir(), ...), so the expected
+      // value must use the native separator too (backslash on Windows).
+      memoryPath: join("/home/tester", ".deeplake", "memory"),
     });
   });
 
@@ -167,6 +174,8 @@ describe("loadConfig — credentials file", () => {
     process.env.HIVEMIND_API_URL = "https://hm-api";
     process.env.HIVEMIND_TABLE = "hm-mem";
     process.env.HIVEMIND_SESSIONS_TABLE = "hm-sess";
+    process.env.HIVEMIND_SKILLS_TABLE = "hm-skills";
+    process.env.HIVEMIND_RULES_TABLE = "hm-rules";
     process.env.HIVEMIND_MEMORY_PATH = "/custom/mem";
     const loadConfig = await importLoadConfig();
     const cfg = loadConfig();
@@ -175,7 +184,71 @@ describe("loadConfig — credentials file", () => {
       apiUrl: "https://hm-api",
       tableName: "hm-mem",
       sessionsTableName: "hm-sess",
+      skillsTableName: "hm-skills",
+      rulesTableName: "hm-rules",
       memoryPath: "/custom/mem",
     });
+  });
+
+  it("rules env var overrides independently of other table names", async () => {
+    process.env.HIVEMIND_TOKEN = "t";
+    process.env.HIVEMIND_ORG_ID = "o";
+    process.env.HIVEMIND_RULES_TABLE = "rules_test";
+    const loadConfig = await importLoadConfig();
+    const cfg = loadConfig();
+    expect(cfg?.rulesTableName).toBe("rules_test");
+    expect(cfg?.tableName).toBe("memory");             // default unchanged
+    expect(cfg?.sessionsTableName).toBe("sessions");   // default unchanged
+  });
+});
+
+describe("loadConfig — workspace alias resolution", () => {
+  function credsWithAliases() {
+    existsSyncMock.mockReturnValue(true);
+    readFileSyncMock.mockReturnValue(JSON.stringify({
+      token: "ftok", orgId: "forg", workspaceId: "default",
+      workspaceAliases: { forg: { "data platform dev": "data-platform-dev" }, other: { "x": "y" } },
+    }));
+  }
+
+  it("maps an env workspace NAME through the learned alias, case-insensitively", async () => {
+    credsWithAliases();
+    process.env.HIVEMIND_WORKSPACE_ID = "Data Platform Dev";
+    const loadConfig = await importLoadConfig();
+    expect(loadConfig()?.workspaceId).toBe("data-platform-dev");
+  });
+
+  it("passes an unknown env value through unchanged (SessionStart warns instead)", async () => {
+    credsWithAliases();
+    process.env.HIVEMIND_WORKSPACE_ID = "nope";
+    const loadConfig = await importLoadConfig();
+    expect(loadConfig()?.workspaceId).toBe("nope");
+  });
+
+  it("only consults aliases of the effective org", async () => {
+    credsWithAliases();
+    process.env.HIVEMIND_ORG_ID = "other";
+    process.env.HIVEMIND_WORKSPACE_ID = "Data Platform Dev";
+    const loadConfig = await importLoadConfig();
+    expect(loadConfig()?.workspaceId).toBe("Data Platform Dev");
+  });
+
+  it("ignores inherited properties in the alias map", async () => {
+    existsSyncMock.mockReturnValue(true);
+    readFileSyncMock.mockReturnValue(JSON.stringify({ token: "ftok", orgId: "forg", workspaceAliases: { forg: { a: "b" } } }));
+    process.env.HIVEMIND_WORKSPACE_ID = "constructor";
+    const loadConfig = await importLoadConfig();
+    expect(loadConfig()?.workspaceId).toBe("constructor");
+  });
+
+  it("never rewrites the 'default' sentinel and exposes the alias map", async () => {
+    existsSyncMock.mockReturnValue(true);
+    readFileSyncMock.mockReturnValue(JSON.stringify({
+      token: "ftok", orgId: "forg", workspaceAliases: { forg: { default: "should-not-apply" } },
+    }));
+    const loadConfig = await importLoadConfig();
+    const cfg = loadConfig();
+    expect(cfg?.workspaceId).toBe("default");
+    expect(cfg?.workspaceAliases).toEqual({ forg: { default: "should-not-apply" } });
   });
 });

@@ -1,6 +1,6 @@
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { HOME, pkgRoot, ensureDir, copyDir, readJson, writeJson, writeVersionStamp, log } from "./util.js";
+import { HOME, pkgRoot, ensureDir, syncDir, readJson, writeJson, writeJsonIfChanged, symlinkForce, writeVersionStamp, log, reportPruned } from "./util.js";
 import { getVersion } from "./version.js";
 
 // Cursor 1.7+ hooks API: https://cursor.com/docs/agent/hooks
@@ -50,15 +50,24 @@ function buildHookConfig(): Record<string, CursorHookEntry[]> {
     preToolUse: [buildHookCmdShellMatcher("pre-tool-use.js", 30)],
     postToolUse: [buildHookCmd("capture.js", 15)],
     afterAgentResponse: [buildHookCmd("capture.js", 15)],
-    stop: [buildHookCmd("capture.js", 15)],
-    sessionEnd: [buildHookCmd("session-end.js", 30)],
+    // graph-on-stop: auto-build the code graph (A1 Cursor parity). Same hook
+    // Claude Code registers under Stop + SessionEnd. It's gated (rate limit +
+    // HEAD-changed + source-diff) so the common path is a ~5ms skip, and runs
+    // async so it never blocks Cursor.
+    stop: [buildHookCmd("capture.js", 15), buildHookCmd("graph-on-stop.js", 30)],
+    sessionEnd: [buildHookCmd("session-end.js", 30), buildHookCmd("graph-on-stop.js", 30)],
   };
 }
 
 export function isHivemindEntry(entry: unknown): boolean {
   if (!entry || typeof entry !== "object") return false;
   const cmd = (entry as { command?: string }).command;
-  return typeof cmd === "string" && cmd.includes("/.cursor/hivemind/bundle/");
+  if (typeof cmd !== "string") return false;
+  // Normalize separators: on Windows the command is written with backslashes
+  // (`...\.cursor\hivemind\bundle\capture.js`), so a forward-slash-only match
+  // would fail and re-install would duplicate the hooks (same Windows bug as
+  // codex's isHivemindHookEntry).
+  return cmd.replace(/\\/g, "/").includes("/.cursor/hivemind/bundle/");
 }
 
 function mergeHooks(existing: Record<string, unknown> | null): Record<string, unknown> {
@@ -90,17 +99,26 @@ export function stripHooksFromConfig(existing: Record<string, unknown> | null): 
 }
 
 export function installCursor(): void {
-  const srcBundle = join(pkgRoot(), "cursor", "bundle");
+  const srcBundle = join(pkgRoot(), "harnesses", "cursor", "bundle");
   if (!existsSync(srcBundle)) {
     throw new Error(`Cursor bundle missing at ${srcBundle}. Run 'npm run build' first.`);
   }
 
   ensureDir(PLUGIN_DIR);
-  copyDir(srcBundle, join(PLUGIN_DIR, "bundle"));
+  reportPruned("Cursor", syncDir(srcBundle, join(PLUGIN_DIR, "bundle")));
 
   const existing = readJson<Record<string, unknown>>(HOOKS_PATH);
   const merged = mergeHooks(existing);
-  writeJson(HOOKS_PATH, merged);
+  // Idempotent (same rationale as codex): skip the rewrite when unchanged so
+  // we don't perturb the hooks.json Cursor/Codex-style trust fingerprints.
+  writeJsonIfChanged(HOOKS_PATH, merged);
+
+  const pluginNm = join(PLUGIN_DIR, "node_modules");
+  const embedDepsNm = join(HOME, ".hivemind", "embed-deps", "node_modules");
+  if (existsSync(embedDepsNm)) {
+    try { const st = lstatSync(pluginNm); if (st.isDirectory() && !st.isSymbolicLink()) rmSync(pluginNm, { recursive: true }); } catch { /* ok */ }
+    symlinkForce(embedDepsNm, pluginNm);
+  }
 
   writeVersionStamp(PLUGIN_DIR, getVersion());
   log(`  Cursor         installed -> ${PLUGIN_DIR}`);

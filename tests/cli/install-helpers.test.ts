@@ -95,6 +95,47 @@ describe("isHivemindHookEntry", () => {
       ],
     }, PD)).toBe(true);
   });
+
+  // Windows separator bug (2026-05-29): codex on Windows writes the hook
+  // command via join() with BACKSLASHES, but the matcher used forward-slash
+  // literals. Result: isHivemindHookEntry returned false on Windows, so
+  // re-install never stripped the prior entry and APPENDED a duplicate
+  // (PostToolUse capture ran twice — the reported bug). Failure-before-fix.
+  describe("Windows backslash paths (separator normalization)", () => {
+    const WPD = "C:\\Users\\angel\\.codex\\hivemind";
+
+    it("true when a backslash command points into <pluginDir>\\bundle\\ (canonical Windows install)", () => {
+      expect(isHivemindHookEntry({
+        hooks: [{ type: "command", command: `node "${WPD}\\bundle\\capture.js"`, timeout: 15 }],
+      }, WPD)).toBe(true);
+    });
+
+    it("true for each known bundle file written with backslashes", () => {
+      for (const f of ["session-start.js", "capture.js", "stop.js", "wiki-worker.js"]) {
+        expect(isHivemindHookEntry({
+          hooks: [{ type: "command", command: `node "C:\\some\\sibling\\bundle\\${f}"` }],
+        }, WPD)).toBe(true);
+      }
+    });
+
+    it("still false for a user's own backslash hook outside bundle/", () => {
+      expect(isHivemindHookEntry({
+        hooks: [{ type: "command", command: `node "C:\\Users\\angel\\.codex\\my-hook.js"` }],
+      }, WPD)).toBe(false);
+    });
+  });
+
+  // Tightens the per-element type guard inside the `.some()` callback so a
+  // refactor that drops `!h || typeof h !== "object"` can't start matching
+  // arrays full of garbage.
+  it.each([
+    ["hooks[] contains null",      { hooks: [null] }],
+    ["hooks[] contains undefined", { hooks: [undefined] }],
+    ["hooks[] contains a string",  { hooks: ["not-an-object"] }],
+    ["hooks[] contains a number",  { hooks: [42] }],
+  ])("false when %s", (_label, entry) => {
+    expect(isHivemindHookEntry(entry, PD)).toBe(false);
+  });
 });
 
 // ─── codex: mergeHooks (the data-loss-fix surface) ────────────────────────
@@ -164,6 +205,24 @@ describe("mergeHooks", () => {
     const hivemindCommands = allCommands.filter(c => c.includes(`${PD}/bundle/`));
     const unique = new Set(hivemindCommands);
     expect(hivemindCommands.length).toBe(unique.size);
+  });
+
+  // The end-to-end repro of the reported Windows bug: re-install on Windows
+  // (backslash commands) must strip the prior hivemind PostToolUse entry, not
+  // accumulate duplicates. Pre-fix this looped to 5 PostToolUse entries.
+  it("Windows backslash re-install: no PostToolUse duplication after N re-runs", () => {
+    const WPD = "C:\\Users\\angel\\.codex\\hivemind";
+    const winOurs = {
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: `node "${WPD}\\bundle\\session-start.js"`, timeout: 10 }] }],
+        PostToolUse:  [{ hooks: [{ type: "command", command: `node "${WPD}\\bundle\\capture.js"`,        timeout: 15 }] }],
+      },
+    };
+    let cur: Record<string, unknown> = {};
+    for (let i = 0; i < 5; i++) cur = mergeHooks(cur, winOurs, WPD);
+    const h = (cur as { hooks: Record<string, unknown[]> }).hooks;
+    expect(h.SessionStart).toHaveLength(1);
+    expect(h.PostToolUse).toHaveLength(1);
   });
 
   it("re-install with mixed prior (user + stale hivemind) keeps user, replaces stale", () => {
@@ -258,6 +317,39 @@ describe("upsertHivemindBlock", () => {
     // And there's a complete marker pair somewhere.
     expect(out).toContain(END);
   });
+
+  it("collapses DUPLICATE blocks (bad merge / manual paste) down to exactly one", () => {
+    const prior = `# Header\n\n${BEGIN}\nfirst\n${END}\n\n## Mid\n\n${BEGIN}\nsecond\n${END}\n\n## Tail`;
+    const out = upsertHivemindBlock(prior);
+    expect((out.match(new RegExp(BEGIN, "g")) ?? []).length).toBe(1);
+    expect((out.match(new RegExp(END, "g")) ?? []).length).toBe(1);
+    // Both stale bodies gone; the surviving scaffold is exactly the user's
+    // content with a single block (asserted via strip → exact remainder).
+    expect(out).not.toContain("first");
+    expect(out).not.toContain("second");
+    expect(stripHivemindBlock(out)).toBe("# Header\n\n## Mid\n\n## Tail\n");
+  });
+
+  it("on reinstall, does NOT delete user text under a preexisting stray BEGIN (data-loss guard)", () => {
+    // A file that already has a stray BEGIN followed by our block (e.g. a prior
+    // install over a half-written marker). Reinstall must replace OUR block in
+    // place without swallowing the user's text under the stray marker.
+    const prior = `# Notes\n${BEGIN}\nuser text under stray marker\n\n${BEGIN}\nold block\n${END}\n`;
+    const out = upsertHivemindBlock(prior);
+    expect(out).toContain("user text under stray marker"); // preserved
+    expect(out).not.toContain("old block"); // our block replaced
+    expect((out.match(new RegExp(END, "g")) ?? []).length).toBe(1); // one well-formed block
+  });
+
+  it("keeps the block IN PLACE on reinstall — does not relocate it below later user notes", () => {
+    const prior = `# Top\n\n${BEGIN}\nold\n${END}\n\n## My overrides\nkeep last`;
+    const out = upsertHivemindBlock(prior);
+    // Block stays between "# Top" and the user's overrides (precedence kept),
+    // not appended at EOF.
+    expect(out.indexOf(BEGIN)).toBeLessThan(out.indexOf("## My overrides"));
+    expect(out.endsWith("## My overrides\nkeep last\n")).toBe(true);
+    expect((out.match(new RegExp(BEGIN, "g")) ?? []).length).toBe(1);
+  });
 });
 
 describe("stripHivemindBlock", () => {
@@ -294,6 +386,27 @@ describe("stripHivemindBlock", () => {
     const prior = `# Header\n${BEGIN}\nbroken — no end marker\nuser stuff after\n`;
     expect(stripHivemindBlock(prior)).toBe(prior);
   });
+
+  it("install→uninstall round-trip removes our block AND preserves user content past a stray BEGIN", () => {
+    // Codex data-loss edge case: the user's AGENTS.md already has a half-written
+    // BEGIN (no END). Install appends a well-formed block; uninstall must remove
+    // OUR block without deleting the user's lines between their stray marker and
+    // our block. Strip must NOT pair the stray BEGIN with our block's END.
+    const userFile = `# Notes\n${BEGIN}\nuser half-wrote this, no end\n`;
+    const installed = upsertHivemindBlock(userFile);
+    expect(installed).toContain(END); // a well-formed block was added
+    const uninstalled = stripHivemindBlock(installed);
+    // Uninstall round-trips EXACTLY back to the user's original file: our block
+    // removed, their stray marker and text fully preserved (no data loss).
+    expect(uninstalled).toBe(userFile);
+  });
+
+  it("removes EVERY block when the file has duplicate marker pairs", () => {
+    const prior = `# Before\n\n${BEGIN}\none\n${END}\n\n## Mid\n\n${BEGIN}\ntwo\n${END}\n\n## After\n`;
+    const out = stripHivemindBlock(prior);
+    // Exact remainder: both blocks removed, user scaffold intact.
+    expect(out).toBe("# Before\n\n## Mid\n\n## After\n");
+  });
 });
 
 // ─── cursor: isHivemindEntry / stripHooksFromConfig ───────────────────────
@@ -305,6 +418,12 @@ describe("isHivemindEntry (cursor)", () => {
 
   it("false when command points elsewhere", () => {
     expect(isHivemindEntry({ command: "/usr/local/bin/my-cursor-hook" })).toBe(false);
+  });
+
+  // Same Windows separator bug as codex: a backslash command must still match
+  // so cursor re-install on Windows strips the prior hooks instead of dup'ing.
+  it("true for a Windows backslash command into .cursor\\hivemind\\bundle\\", () => {
+    expect(isHivemindEntry({ command: `node "C:\\Users\\u\\.cursor\\hivemind\\bundle\\capture.js"` })).toBe(true);
   });
 
   it.each([

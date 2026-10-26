@@ -11,7 +11,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -20,17 +20,20 @@ import { tmpdir } from "node:os";
 // internal SQL-wrapping lambda) is uncoverable in tests, dropping the file's
 // function-coverage below the configured 90% threshold.
 const apiQueryMock = vi.fn();
+const apiKnownTablesMock = vi.fn();
 vi.mock("../../src/deeplake-api.js", () => ({
   // Class form is required because the source code uses `new DeeplakeApi(...)`.
   // `vi.fn().mockImplementation(arrow)` won't work as a constructor.
   DeeplakeApi: class {
     query(sql: string) { return apiQueryMock(sql); }
+    knownTablesOrNull() { return apiKnownTablesMock(); }
   },
 }));
 
 import { autoPullSkills } from "../../src/skillify/auto-pull.js";
 import type { QueryFn } from "../../src/skillify/pull.js";
 import type { Config } from "../../src/config.js";
+import { setFakeHome, clearFakeHome } from "../shared/fake-home.js";
 
 // ─── Test harness ──────────────────────────────────────────────────────────────
 // We pin HOME to a per-test temp dir so any file writes land in the sandbox
@@ -42,13 +45,14 @@ const realHome = process.env.HOME;
 
 beforeEach(() => {
   tmpHome = mkdtempSync(join(tmpdir(), "autopull-"));
-  process.env.HOME = tmpHome;
+  setFakeHome(tmpHome);
   delete process.env.HIVEMIND_AUTOPULL_DISABLED;
   apiQueryMock.mockReset();
+  apiKnownTablesMock.mockReset().mockResolvedValue(null);
 });
 
 afterEach(() => {
-  process.env.HOME = realHome;
+  clearFakeHome();
   delete process.env.HIVEMIND_AUTOPULL_DISABLED;
   try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* nothing */ }
 });
@@ -66,6 +70,10 @@ function makeConfig(): Config {
     tableName: "memory",
     sessionsTableName: "sessions",
     skillsTableName: "skills",
+    rulesTableName: "hivemind_rules",
+    goalsTableName: "hivemind_goals",
+    docsTableName: "hivemind_docs",
+    codebaseTableName: "codebase",
     memoryPath: join(tmpHome, ".deeplake", "memory"),
   };
 }
@@ -244,5 +252,48 @@ describe("autoPullSkills — no-queryFn path (uses DeeplakeApi)", () => {
     expect(apiQueryMock).toHaveBeenCalledTimes(1);
     expect(apiQueryMock.mock.calls[0][0]).toContain(`FROM "skills"`);
     expect(existsSync(join(tmpHome, ".claude/skills/shared-skill--alice/SKILL.md"))).toBe(true);
+  });
+
+  it("a hanging table-discovery (knownTablesOrNull) is bounded by the timeout", async () => {
+    // Regression: table discovery must run INSIDE the withTimeout budget, not
+    // before it — otherwise a slow GET /tables blocks SessionStart past
+    // timeoutMs. knownTablesOrNull never resolves here.
+    apiKnownTablesMock.mockReturnValue(new Promise(() => { /* never */ }));
+    apiQueryMock.mockResolvedValue([sampleRow()]);
+    const loadConfigFn = () => makeConfig();
+    const start = Date.now();
+    const result = await autoPullSkills({
+      loadConfigFn, install: "project", cwd: tmpHome, timeoutMs: 100,
+    });
+    const elapsed = Date.now() - start;
+    expect(result).toEqual({ pulled: 0, skipped: true, reason: "error" });
+    expect(elapsed).toBeLessThan(1000); // bounded by the 100ms timeout
+    expect(apiQueryMock).not.toHaveBeenCalled(); // never got past discovery
+  });
+});
+
+describe("autoPullSkills — default config path routes through .hivemind", () => {
+  afterEach(() => {
+    delete process.env.HIVEMIND_TOKEN;
+    delete process.env.HIVEMIND_ORG_ID;
+    delete process.env.HIVEMIND_WORKSPACE_ID;
+  });
+
+  it("with no injected loadConfigFn, resolves the routed config from cwd (loadRoutedConfig)", async () => {
+    // Exercises the real default: loadRoutedConfig(deps.cwd). Env-based creds
+    // (fake HOME means no credentials.json) keep it offline; the injected
+    // queryFn stands in for the network. A `.hivemind` in cwd proves the
+    // default path routes rather than falling back to the global workspace.
+    process.env.HIVEMIND_TOKEN = "env-tok";
+    process.env.HIVEMIND_ORG_ID = "env-org";
+    writeFileSync(join(tmpHome, ".hivemind"), JSON.stringify({ workspaceId: "routed-ws" }));
+    const { fn: queryFn, calls } = makeMockQuery([sampleRow()]);
+
+    const result = await autoPullSkills({ queryFn, install: "project", cwd: tmpHome });
+
+    // Not the "not-logged-in" skip — the default loadRoutedConfig produced a
+    // config, so the pull actually ran against the injected query.
+    expect(result.reason).not.toBe("not-logged-in");
+    expect(calls.length).toBeGreaterThan(0);
   });
 });

@@ -2,18 +2,23 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  fstatSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { sqlIdent, sqlStr } from "../utils/sql.js";
+import { log } from "../utils/debug.js";
 
 export interface SessionQueueApi {
   query(sql: string): Promise<Record<string, unknown>[]>;
@@ -67,6 +72,14 @@ export interface DrainSessionQueueResult {
 }
 
 const DEFAULT_QUEUE_DIR = join(homedir(), ".deeplake", "queue");
+// Hard ceiling for a single session's queue file. The queue is a retry buffer
+// for rows the backend has not accepted yet, so it only reaches this size when
+// uploads have been failing for a very long time (offline host, disconnected
+// network filesystem). Past the ceiling we stop appending instead of filling
+// the user's disk: a customer running Cowork hit a single 39.9 GB queue file
+// growing ~5 GB/day (2026-08-19). A file this large is also unflushable —
+// readQueuedRows() reads it whole — so gcOversizedQueueFiles() drops it.
+export const MAX_SESSION_QUEUE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_BATCH_ROWS = 50;
 const DEFAULT_STALE_INFLIGHT_MS = 60_000;
 const DEFAULT_AUTH_FAILURE_TTL_MS = 5 * 60_000;
@@ -116,19 +129,187 @@ export function buildQueuedSessionRow(args: {
   };
 }
 
-export function appendQueuedSessionRow(row: QueuedSessionRow, queueDir = DEFAULT_QUEUE_DIR): string {
+export interface AppendQueuedRowResult {
+  queuePath: string;
+  /** false when the row was dropped because the file sits at its ceiling. */
+  appended: boolean;
+}
+
+export function appendQueuedSessionRow(
+  row: QueuedSessionRow,
+  queueDir = DEFAULT_QUEUE_DIR,
+  maxQueueBytes = MAX_SESSION_QUEUE_BYTES,
+): AppendQueuedRowResult {
+  return appendQueuedSessionRows([row], queueDir, maxQueueBytes);
+}
+
+/**
+ * Append a group of rows to one session's queue file, all-or-nothing.
+ *
+ * The caller uses the group to keep a transcript line atomic: either every row
+ * for that line is queued, or none is and the caller can retry the whole line
+ * later. Three things make that hold:
+ *   - the size check and the write share ONE descriptor, so the size the check
+ *     saw is the size the write extends (a stat-then-append on the path is
+ *     CodeQL's js/file-system-race, and several Cowork MCP processes write
+ *     these files);
+ *   - writeSync is looped, because it is allowed to write fewer bytes than
+ *     asked for;
+ *   - a write that throws part-way is truncated back to where it started, so
+ *     the queue never holds half a JSON line.
+ *
+ * Rollback is what makes this single-writer: truncating while another process
+ * appends would destroy its rows, so the rollback is skipped unless the file is
+ * exactly as this call left it. The Cowork ingest — the only caller — holds an
+ * exclusive lock (~/.deeplake/.cowork-ingest.lock) for the whole tick, so two
+ * appenders do not overlap in practice. A malformed tail that survives anyway
+ * (failed rollback, a crash mid-write, an older build) is skipped by
+ * readQueuedRows rather than wedging the drain forever.
+ */
+export function appendQueuedSessionRows(
+  rows: QueuedSessionRow[],
+  queueDir = DEFAULT_QUEUE_DIR,
+  maxQueueBytes = MAX_SESSION_QUEUE_BYTES,
+): AppendQueuedRowResult {
+  if (rows.length === 0) throw new Error("appendQueuedSessionRows: rows must not be empty");
   mkdirSync(queueDir, { recursive: true });
-  const sessionId = extractSessionId(row.path);
-  const queuePath = getQueuePath(queueDir, sessionId);
-  appendFileSync(queuePath, `${JSON.stringify(row)}\n`);
-  return queuePath;
+  const queuePath = getQueuePath(queueDir, extractSessionId(rows[0].path));
+  const rowsPayload = Buffer.from(rows.map(row => `${JSON.stringify(row)}\n`).join(""), "utf-8");
+
+  // "a+" (not "a"): appends, but is also readable, so endsWithNewline() below
+  // can inspect the last byte. With "a" the descriptor is write-only and that
+  // read fails with EBADF.
+  const fd = openSync(queuePath, "a+");
+  try {
+    const startedAt = fstatSync(fd).size;
+    // If the file does not end in a newline, a previous append died half-way.
+    // Start on a fresh line so THESE rows stay parseable — otherwise they are
+    // glued onto the broken fragment and skipped with it at read time.
+    const payload = endsWithNewline(fd, startedAt)
+      ? rowsPayload
+      : Buffer.concat([Buffer.from("\n", "utf-8"), rowsPayload]);
+    if (startedAt + payload.length > maxQueueBytes) {
+      log("session-queue", `queue file at the ${maxQueueBytes}-byte ceiling, refusing ${rows.length} row(s): ${queuePath}`);
+      return { queuePath, appended: false };
+    }
+    let written = 0;
+    try {
+      while (written < payload.length) {
+        written += writeSync(fd, payload, written, payload.length - written);
+      }
+    } catch (e: unknown) {
+      // A throwing writeSync does not report how much it wrote, so bound the
+      // rollback by what this call could possibly have written: if the file has
+      // grown past startedAt + payload.length, another writer appended in the
+      // meantime and truncating would destroy its rows. Leave it alone then —
+      // readQueuedRows skips the malformed tail instead of wedging the drain.
+      try {
+        if (fstatSync(fd).size <= startedAt + payload.length) ftruncateSync(fd, startedAt);
+      } catch {
+        /* rollback failed — the malformed line is skipped at read time */
+      }
+      log("session-queue", `append failed after ${written}/${payload.length} bytes: ${e instanceof Error ? e.message : String(e)}`);
+      return { queuePath, appended: false };
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return { queuePath, appended: true };
+}
+
+/**
+ * Delete queue/inflight files that have grown past the ceiling. Such a file
+ * cannot be flushed anyway (readQueuedRows reads it into a single string) and
+ * would otherwise sit on disk forever — it is the residue of an upload outage,
+ * not data the backend is still waiting for. Returns the bytes reclaimed.
+ */
+export function gcOversizedQueueFiles(
+  queueDir = DEFAULT_QUEUE_DIR,
+  maxQueueBytes = MAX_SESSION_QUEUE_BYTES,
+  onDropped?: (path: string, sizeBytes: number) => void,
+): number {
+  let reclaimed = 0;
+  let names: string[];
+  try {
+    names = readdirSync(queueDir);
+  } catch {
+    return 0;
+  }
+  for (const name of names) {
+    // Skip queue metadata (drain lock, disabled marker, any journal a caller
+    // parks here): it is bookkeeping, never rows the backend is owed.
+    if (name.startsWith(".")) continue;
+    if (!name.endsWith(".jsonl") && !name.endsWith(".inflight")) continue;
+    const path = join(queueDir, name);
+    const size = fileSize(path);
+    // Strictly ABOVE the ceiling. appendQueuedSessionRow never lets a file
+    // exceed it, so anything caught here is residue from a build that predates
+    // the ceiling — not rows the backend is still waiting for. A file sitting
+    // exactly at the ceiling is legitimate and is left alone to be flushed.
+    if (size <= maxQueueBytes) continue;
+    try {
+      rmSync(path, { force: true });
+      reclaimed += size;
+      log("session-queue", `dropped oversized queue file (${size} bytes): ${path}`);
+      // The rows in it were never acknowledged by the backend. Hand the caller
+      // the loss so it can be recorded somewhere durable rather than only in a
+      // debug log nobody has enabled.
+      onDropped?.(path, size);
+    } catch {
+      /* best effort */
+    }
+  }
+  return reclaimed;
+}
+
+/** Bytes one row occupies in a queue file, newline included. */
+export function queuedRowBytes(row: QueuedSessionRow): number {
+  return Buffer.byteLength(`${JSON.stringify(row)}\n`, "utf-8");
+}
+
+/**
+ * Bytes still available in a session's queue file before it hits the ceiling.
+ * Lets a caller check that a whole group of rows fits BEFORE appending any of
+ * them, so it never leaves half a transcript line queued.
+ */
+export function sessionQueueRoomBytes(
+  sessionId: string,
+  queueDir = DEFAULT_QUEUE_DIR,
+  maxQueueBytes = MAX_SESSION_QUEUE_BYTES,
+): number {
+  return Math.max(0, maxQueueBytes - fileSize(getQueuePath(queueDir, sessionId)));
+}
+
+/** True when the file is empty or its last byte is a newline. */
+function endsWithNewline(fd: number, size: number): boolean {
+  if (size === 0) return true;
+  try {
+    const tail = Buffer.alloc(1);
+    readSync(fd, tail, 0, 1, size - 1);
+    return tail[0] === 0x0a;
+  } catch {
+    return true; // cannot tell — do not inject a stray newline
+  }
+}
+
+function fileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
 }
 
 export function buildSessionInsertSql(sessionsTable: string, rows: QueuedSessionRow[]): string {
   if (rows.length === 0) throw new Error("buildSessionInsertSql: rows must not be empty");
   const table = sqlIdent(sessionsTable);
   const values = rows.map((row) => {
-    const jsonForSql = sqlStr(coerceJsonbPayload(row.message));
+    // Escape ONLY single quotes for the SQL literal. The payload is already
+    // valid JSON and Postgres (standard_conforming_strings) treats backslashes
+    // literally, so sqlStr()'s backslash-doubling and control-char stripping
+    // would corrupt the JSON and the jsonb cast would 400. Mirrors the
+    // capture.ts direct-INSERT path.
+    const jsonForSql = coerceJsonbPayload(row.message).replace(/'/g, "''");
     return (
       `('${sqlStr(row.id)}', '${sqlStr(row.path)}', '${sqlStr(row.filename)}', '${jsonForSql}'::jsonb, ` +
       `'${sqlStr(row.author)}', ${row.sizeBytes}, '${sqlStr(row.project)}', '${sqlStr(row.description)}', ` +
@@ -136,10 +317,17 @@ export function buildSessionInsertSql(sessionsTable: string, rows: QueuedSession
     );
   }).join(", ");
 
+  // Idempotent batch insert: skip any row whose id already exists, so a flush
+  // that re-sends the batch after a transient 5xx (the insert committed but the
+  // gateway returned 502/503) cannot duplicate rows. The sessions table has no
+  // UNIQUE constraint on id, so this anti-join is the multi-row equivalent of
+  // buildDirectSessionInsertSql's `WHERE NOT EXISTS` guard on the single-row
+  // capture path. Verified lag-safe against the real backend.
   return (
-    `INSERT INTO "${table}" ` +
-    `(id, path, filename, message, author, size_bytes, project, description, agent, plugin_version, creation_date, last_update_date) ` +
-    `VALUES ${values}`
+    `INSERT INTO "${table}" (id, path, filename, message, author, size_bytes, project, description, agent, plugin_version, creation_date, last_update_date) ` +
+    `SELECT v.id, v.path, v.filename, v.message, v.author, v.size_bytes, v.project, v.description, v.agent, v.plugin_version, v.creation_date, v.last_update_date ` +
+    `FROM (VALUES ${values}) AS v(id, path, filename, message, author, size_bytes, project, description, agent, plugin_version, creation_date, last_update_date) ` +
+    `WHERE NOT EXISTS (SELECT 1 FROM "${table}" AS t WHERE t.id = v.id)`
   );
 }
 
@@ -357,11 +545,22 @@ async function flushInflightFile(
 
 function readQueuedRows(path: string): QueuedSessionRow[] {
   const raw = readFileSync(path, "utf-8");
-  return raw
-    .split("\n")
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as QueuedSessionRow);
+  const rows: QueuedSessionRow[] = [];
+  let malformed = 0;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      rows.push(JSON.parse(trimmed) as QueuedSessionRow);
+    } catch {
+      // A half-written record — a crash mid-append, a rollback that could not
+      // run. Skipping it costs one message; throwing would fail this flush and
+      // every flush after it, stranding the whole queue permanently.
+      malformed += 1;
+    }
+  }
+  if (malformed > 0) log("session-queue", `skipped ${malformed} malformed row(s) in ${path}`);
+  return rows;
 }
 
 function requeueInflight(queuePath: string, inflightPath: string): void {

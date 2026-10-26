@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as yaml from "js-yaml";
+import { setFakeHome, clearFakeHome } from "../shared/fake-home.js";
 
 /**
  * Tests for src/cli/install-hermes.ts. This is the most surface-area-rich
@@ -24,25 +25,25 @@ beforeEach(() => {
   tmpPkg = join(tmpRoot, "pkg");
   mkdirSync(tmpHome, { recursive: true });
 
-  mkdirSync(join(tmpPkg, "hermes", "bundle"), { recursive: true });
-  writeFileSync(join(tmpPkg, "hermes", "bundle", "session-start.js"), "// fake bundle");
-  writeFileSync(join(tmpPkg, "hermes", "bundle", "capture.js"), "// fake bundle");
-  writeFileSync(join(tmpPkg, "hermes", "bundle", "pre-tool-use.js"), "// fake bundle");
-  writeFileSync(join(tmpPkg, "hermes", "bundle", "session-end.js"), "// fake bundle");
+  mkdirSync(join(tmpPkg, "harnesses", "hermes", "bundle"), { recursive: true });
+  writeFileSync(join(tmpPkg, "harnesses", "hermes", "bundle", "session-start.js"), "// fake bundle");
+  writeFileSync(join(tmpPkg, "harnesses", "hermes", "bundle", "capture.js"), "// fake bundle");
+  writeFileSync(join(tmpPkg, "harnesses", "hermes", "bundle", "pre-tool-use.js"), "// fake bundle");
+  writeFileSync(join(tmpPkg, "harnesses", "hermes", "bundle", "session-end.js"), "// fake bundle");
 
   mkdirSync(join(tmpPkg, "mcp", "bundle"), { recursive: true });
   writeFileSync(join(tmpPkg, "mcp", "bundle", "server.js"), "// fake mcp server");
 
   writeFileSync(join(tmpPkg, "package.json"), JSON.stringify({ version: "3.4.5" }));
 
-  vi.stubEnv("HOME", tmpHome);
+  setFakeHome(tmpHome);
   vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 });
 
 afterEach(() => {
   rmSync(tmpRoot, { recursive: true, force: true });
-  vi.unstubAllEnvs();
+  clearFakeHome();
   vi.restoreAllMocks();
   vi.resetModules();
 });
@@ -94,9 +95,13 @@ describe("installHermes — cold install", () => {
       "pre_tool_call",
     ]);
     for (const event of Object.keys(cfg.hooks)) {
-      expect(cfg.hooks[event]).toHaveLength(1);
+      // on_session_end carries TWO hooks: session-end capture + graph-on-stop
+      // (G3 code-graph auto-build parity). Every other event has exactly one.
+      expect(cfg.hooks[event]).toHaveLength(event === "on_session_end" ? 2 : 1);
     }
     expect(cfg.hooks.pre_tool_call[0].matcher).toBe("terminal");
+    // graph-on-stop is the second on_session_end hook (G3).
+    expect(cfg.hooks.on_session_end.some((h: { command: string }) => h.command.includes("graph-on-stop.js"))).toBe(true);
   });
 
   it("preserves a user-defined hook on a non-hivemind event", async () => {
@@ -127,12 +132,12 @@ describe("installHermes — cold install", () => {
     for (let i = 0; i < 4; i++) installHermes();
     const cfg = readConfig();
     for (const event of Object.keys(cfg.hooks)) {
-      expect(cfg.hooks[event]).toHaveLength(1);
+      expect(cfg.hooks[event]).toHaveLength(event === "on_session_end" ? 2 : 1);
     }
   });
 
   it("throws when the hermes hook bundle source is missing (build hasn't run)", async () => {
-    rmSync(join(tmpPkg, "hermes", "bundle"), { recursive: true, force: true });
+    rmSync(join(tmpPkg, "harnesses", "hermes", "bundle"), { recursive: true, force: true });
     const { installHermes } = await importInstaller();
     expect(() => installHermes()).toThrow(/Hermes bundle missing/);
   });

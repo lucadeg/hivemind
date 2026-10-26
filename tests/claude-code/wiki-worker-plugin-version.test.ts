@@ -7,7 +7,7 @@ import { join } from "node:path";
  * Functional pluginVersion threading test for the cursor / hermes / pi
  * wiki-worker variants.
  *
- * `claude-code/tests/wiki-worker.test.ts` already exhaustively tests the
+ * `harnesses/claude-code/tests/wiki-worker.test.ts` already exhaustively tests the
  * shared worker structure for the claude-code variant. This file is a
  * narrower guard: for each of the three sibling agents, the worker MUST
  * read `cfg.pluginVersion` from its spawn-config JSON and forward it to
@@ -24,6 +24,7 @@ import { join } from "node:path";
 
 const finalizeSummaryMock = vi.fn();
 const releaseLockMock = vi.fn();
+const readStateMock = vi.fn();
 const uploadSummaryMock = vi.fn();
 const execFileSyncMock = vi.fn();
 const embedSummaryMock = vi.fn();
@@ -34,6 +35,7 @@ const originalArgv2 = process.argv[2];
 vi.mock("../../src/hooks/summary-state.js", () => ({
   finalizeSummary: (...a: any[]) => finalizeSummaryMock(...a),
   releaseLock: (...a: any[]) => releaseLockMock(...a),
+  readState: (...a: any[]) => readStateMock(...a),
 }));
 vi.mock("../../src/hooks/upload-summary.js", () => ({
   uploadSummary: (...a: any[]) => uploadSummaryMock(...a),
@@ -100,6 +102,7 @@ beforeEach(() => {
   fetchMock.mockReset();
   finalizeSummaryMock.mockReset();
   releaseLockMock.mockReset();
+  readStateMock.mockReset().mockReturnValue(null);
   uploadSummaryMock.mockReset().mockResolvedValue({ path: "insert", summaryLength: 100, descLength: 20, sql: "..." });
   embedSummaryMock.mockReset().mockResolvedValue([0.1, 0.2, 0.3]);
   // execFileSync stub: simulate the LLM by writing the summary file the
@@ -124,6 +127,7 @@ async function runVariant(variant: AgentVariant, pluginVersion: string): Promise
   // Then SELECT summary FROM "memory" WHERE path = ... LIMIT 1 (to resume).
   fetchMock.mockImplementation(async (_url: string, init: any) => {
     const sql = JSON.parse(init.body).query as string;
+    if (sql.startsWith("SELECT count(*) AS n")) return jsonResp({ columns: ["n"], rows: [[1]] });
     if (sql.startsWith("SELECT message, creation_date")) {
       return jsonResp({
         columns: ["message", "creation_date"],
@@ -184,6 +188,7 @@ describe("wiki-worker pluginVersion threading — per agent", () => {
       process.argv[2] = configPath;
       fetchMock.mockImplementation(async (_url: string, init: any) => {
         const sql = JSON.parse(init.body).query as string;
+        if (sql.startsWith("SELECT count(*) AS n")) return jsonResp({ columns: ["n"], rows: [[1]] });
         if (sql.startsWith("SELECT message, creation_date")) {
           return jsonResp({
             columns: ["message", "creation_date"],
@@ -254,6 +259,7 @@ describe("wiki-worker API retry path — per agent", () => {
       let firstEventsCall = true;
       fetchMock.mockImplementation(async (_url: string, init: any) => {
         const sql = JSON.parse(init.body).query as string;
+        if (sql.startsWith("SELECT count(*) AS n")) return jsonResp({ columns: ["n"], rows: [[1]] });
         if (sql.startsWith("SELECT message, creation_date")) {
           if (firstEventsCall) {
             firstEventsCall = false;
@@ -295,10 +301,17 @@ describe("wiki-worker resume + embeddings-disabled branches — per agent", () =
       process.argv[2] = configPath;
       fetchMock.mockImplementation(async (_url: string, init: any) => {
         const sql = JSON.parse(init.body).query as string;
+        if (sql.startsWith("SELECT count(*) AS n")) return jsonResp({ columns: ["n"], rows: [[43]] });
         if (sql.startsWith("SELECT message, creation_date")) {
+          // 43 rows so the offset-42 resume baseline still leaves 1 new row to
+          // summarize (otherwise the worker correctly skips a no-new-rows run).
+          // Newest-first (DESC) to match the real ORDER BY … DESC; worker reverses.
           return jsonResp({
             columns: ["message", "creation_date"],
-            rows: [[JSON.stringify({ type: "user_message", content: "hi" }), "2026-04-20T00:00:00Z"]],
+            rows: Array.from({ length: 43 }, (_, i) => [
+              JSON.stringify({ type: "user_message", content: `hi ${42 - i}` }),
+              "2026-04-20T00:00:00Z",
+            ]),
           });
         }
         if (sql.startsWith("SELECT DISTINCT path")) {
@@ -326,11 +339,13 @@ describe("wiki-worker resume + embeddings-disabled branches — per agent", () =
       expect(uploadSummaryMock.mock.calls[0][1].pluginVersion).toBe("9.9.9");
     });
 
-    it(`${v.agent}: HIVEMIND_EMBEDDINGS=false skips the embed daemon`, async () => {
+    it(`${v.agent}: user-disabled embeddings skip the embed daemon`, async () => {
       // Hit the embeddingsDisabled() branch — uploadSummary should still
       // be called, but with embedding === null (skipped daemon hop).
-      const prev = process.env.HIVEMIND_EMBEDDINGS;
-      process.env.HIVEMIND_EMBEDDINGS = "false";
+      const tmpConfig = join(rootDir, "user-config.json");
+      writeFileSync(tmpConfig, JSON.stringify({ embeddings: { enabled: false } }), "utf-8");
+      const prev = process.env.HIVEMIND_CONFIG_PATH;
+      process.env.HIVEMIND_CONFIG_PATH = tmpConfig;
       try {
         await runVariant(v, "9.9.9");
         expect(uploadSummaryMock).toHaveBeenCalledOnce();
@@ -338,8 +353,8 @@ describe("wiki-worker resume + embeddings-disabled branches — per agent", () =
         expect(params.embedding).toBeNull();
         expect(params.pluginVersion).toBe("9.9.9");
       } finally {
-        if (prev === undefined) delete process.env.HIVEMIND_EMBEDDINGS;
-        else process.env.HIVEMIND_EMBEDDINGS = prev;
+        if (prev === undefined) delete process.env.HIVEMIND_CONFIG_PATH;
+        else process.env.HIVEMIND_CONFIG_PATH = prev;
       }
     });
   }
@@ -381,6 +396,7 @@ describe("wiki-worker error / edge-case branches — per agent", () => {
       // found" and exits early before invoking the LLM or upload path.
       fetchMock.mockImplementation(async (_url: string, init: any) => {
         const sql = JSON.parse(init.body).query as string;
+        if (sql.startsWith("SELECT count(*) AS n")) return jsonResp({ columns: ["n"], rows: [[0]] });
         if (sql.startsWith("SELECT message, creation_date")) {
           return jsonResp({ columns: ["message", "creation_date"], rows: [] });
         }

@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
+import { setFakeHome } from "../shared/fake-home.js";
 
 /**
  * Functional tests for summary-state. The module computes STATE_DIR from
@@ -26,7 +27,7 @@ let mod: typeof import("../../src/hooks/summary-state.js");
 
 beforeAll(async () => {
   tmpHome = mkdtempSync(join(tmpdir(), "summary-state-test-"));
-  process.env.HOME = tmpHome;
+  setFakeHome(tmpHome);
   mod = await import("../../src/hooks/summary-state.js");
 });
 
@@ -181,6 +182,206 @@ describe("finalizeSummary", () => {
     const s = JSON.parse(readFileSync(mod.statePath(sid), "utf-8"));
     expect(s.lastSummaryCount).toBe(4);
     expect(s.totalCount).toBe(4);
+  });
+});
+
+describe("session liveness (isSessionLive / markSessionEnded / clearSessionEnded)", () => {
+  it("a never-seen session (no state file) is not live", () => {
+    expect(mod.isSessionLive(newSessionId())).toBe(false);
+  });
+
+  it("a session with a fresh heartbeat (recent state-file write) is live", () => {
+    const sid = newSessionId();
+    mod.bumpTotalCount(sid); // writes the state file → mtime ~now
+    expect(mod.isSessionLive(sid)).toBe(true);
+  });
+
+  it("a session whose last event predates the window is not live", () => {
+    const sid = newSessionId();
+    mod.bumpTotalCount(sid);
+    // Backdate the heartbeat 20 minutes — outside the default 10-min window.
+    const old = new Date(Date.now() - 20 * 60 * 1000);
+    utimesSync(mod.statePath(sid), old, old);
+    expect(mod.isSessionLive(sid)).toBe(false);
+    // ...but a wide enough window still counts it as live.
+    expect(mod.isSessionLive(sid, 60 * 60 * 1000)).toBe(true);
+  });
+
+  it("touchSessionActivity re-arms a stale heartbeat so the mtime fallback reads live (CodeRabbit)", () => {
+    const sid = newSessionId();
+    mod.bumpTotalCount(sid);
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    utimesSync(mod.statePath(sid), old, old);
+    expect(mod.isSessionLive(sid)).toBe(false); // stale + no owner → not live
+    mod.touchSessionActivity(sid);
+    expect(mod.isSessionLive(sid)).toBe(true);  // heartbeat re-armed
+  });
+
+  it("touchSessionActivity seeds empty state and never bumps counters", () => {
+    const sid = newSessionId();
+    mod.touchSessionActivity(sid); // no prior state
+    let s = JSON.parse(readFileSync(mod.statePath(sid), "utf-8"));
+    expect(s.totalCount).toBe(0);
+    expect(s.lastSummaryCount).toBe(0);
+    mod.bumpTotalCount(sid); mod.bumpTotalCount(sid);
+    mod.touchSessionActivity(sid); // must preserve the count
+    s = JSON.parse(readFileSync(mod.statePath(sid), "utf-8"));
+    expect(s.totalCount).toBe(2);
+  });
+
+  it("markSessionEnded makes a fresh session not live (clean exit beats heartbeat)", () => {
+    const sid = newSessionId();
+    mod.bumpTotalCount(sid);
+    expect(mod.isSessionLive(sid)).toBe(true);
+    mod.markSessionEnded(sid);
+    expect(mod.isSessionLive(sid)).toBe(false);
+  });
+
+  it("clearSessionEnded re-activates a session (resume re-arms the heartbeat)", () => {
+    const sid = newSessionId();
+    mod.bumpTotalCount(sid);
+    mod.markSessionEnded(sid);
+    expect(mod.isSessionLive(sid)).toBe(false);
+    mod.clearSessionEnded(sid);
+    expect(mod.isSessionLive(sid)).toBe(true);
+  });
+
+  it("clearSessionEnded on a session with no marker is a no-op", () => {
+    const sid = newSessionId();
+    expect(() => mod.clearSessionEnded(sid)).not.toThrow();
+  });
+
+  it("the ended marker beats a fresh heartbeat regardless of window", () => {
+    const sid = newSessionId();
+    mod.bumpTotalCount(sid);
+    mod.markSessionEnded(sid);
+    expect(mod.isSessionLive(sid, 60 * 60 * 1000)).toBe(false);
+  });
+});
+
+describe("owner-process liveness (procInfo / findSessionOwner / ownerLiveness)", () => {
+  // Linux-only (depends on /proc). Skip the whole suite elsewhere. hasProc is
+  // evaluated at collection time (before beforeAll), so probe /proc with fs
+  // directly rather than through `mod`, which isn't imported yet.
+  const hasProc = existsSync(`/proc/${process.pid}/stat`);
+  const me = () => mod.procInfo(process.pid);
+  const writeOwner = (sid: string, owner: any) =>
+    writeFileSync(mod.ownerPath(sid), JSON.stringify(owner));
+
+  it.runIf(hasProc)("procInfo reads comm + starttime for the current process", () => {
+    const info = me()!;
+    expect(typeof info.comm).toBe("string");
+    expect(info.comm.length).toBeGreaterThan(0);
+    expect(typeof info.starttime).toBe("string");
+  });
+
+  it("procInfo returns null for a non-existent pid", () => {
+    expect(mod.procInfo(2_000_000_000)).toBeNull();
+  });
+
+  it.runIf(hasProc)("findSessionOwner walks up to a process matching agentComms", () => {
+    const info = me()!;
+    // The current process matches immediately when we search for its own comm.
+    const owner = mod.findSessionOwner([info.comm], process.pid);
+    expect(owner).not.toBeNull();
+    expect(owner!.pid).toBe(process.pid);
+    expect(owner!.comm).toBe(info.comm);
+  });
+
+  it.runIf(hasProc)("findSessionOwner returns null when no ancestor matches", () => {
+    expect(mod.findSessionOwner(["no-such-process-xyz"], process.pid)).toBeNull();
+  });
+
+  it("ownerLiveness is 'unknown' with no recorded owner", () => {
+    expect(mod.ownerLiveness(newSessionId())).toBe("unknown");
+  });
+
+  it("recordSessionOwner writes nothing when no matching agent ancestor exists", () => {
+    const sid = newSessionId();
+    mod.recordSessionOwner(sid, ["no-such-agent-xyz"], process.pid);
+    expect(mod.ownerLiveness(sid)).toBe("unknown"); // no owner file written
+  });
+
+  it("ensureSessionOwner does not overwrite an existing owner record", () => {
+    const sid = newSessionId();
+    writeOwner(sid, { pid: 1, comm: "sentinel", starttime: "1" });
+    mod.ensureSessionOwner(sid, ["claude"], process.pid); // file exists → no-op
+    expect(JSON.parse(readFileSync(mod.ownerPath(sid), "utf-8")).comm).toBe("sentinel");
+  });
+
+  it.runIf(hasProc)("recordSessionOwner + ownerLiveness reports a running owner 'alive'", () => {
+    const sid = newSessionId();
+    const info = me()!;
+    // Record the current process as the owner (search for its own comm).
+    mod.recordSessionOwner(sid, [info.comm], process.pid);
+    expect(mod.ownerLiveness(sid)).toBe("alive");
+  });
+
+  it.runIf(hasProc)("ownerLiveness reports 'dead' when the recorded pid is gone", () => {
+    const sid = newSessionId();
+    writeOwner(sid, { pid: 2_000_000_000, comm: "claude", starttime: "1" });
+    expect(mod.ownerLiveness(sid)).toBe("dead");
+  });
+
+  it.runIf(hasProc)("ownerLiveness reports 'dead' when the live pid's comm no longer matches", () => {
+    const sid = newSessionId();
+    const info = me()!;
+    writeOwner(sid, { pid: process.pid, comm: "totally-different-comm", starttime: info.starttime });
+    expect(mod.ownerLiveness(sid)).toBe("dead");
+  });
+
+  it.runIf(hasProc)("ownerLiveness reports 'dead' on pid reuse (starttime mismatch)", () => {
+    const sid = newSessionId();
+    const info = me()!;
+    writeOwner(sid, { pid: process.pid, comm: info.comm, starttime: "999999999" });
+    expect(mod.ownerLiveness(sid)).toBe("dead");
+  });
+
+  it.runIf(hasProc)("a live owner keeps the session live even with a long-stale heartbeat", () => {
+    const sid = newSessionId();
+    const info = me()!;
+    mod.bumpTotalCount(sid);
+    const old = new Date(Date.now() - 60 * 60 * 1000); // 1h ago — well past the window
+    utimesSync(mod.statePath(sid), old, old);
+    mod.recordSessionOwner(sid, [info.comm], process.pid);
+    expect(mod.isSessionLive(sid)).toBe(true);
+  });
+
+  it.runIf(hasProc)("a dead owner makes the session not live even with a fresh heartbeat", () => {
+    const sid = newSessionId();
+    mod.bumpTotalCount(sid); // fresh heartbeat
+    writeOwner(sid, { pid: 2_000_000_000, comm: "claude", starttime: "1" });
+    expect(mod.isSessionLive(sid)).toBe(false);
+  });
+
+  it.runIf(hasProc)("the ended marker beats even a live owner", () => {
+    const sid = newSessionId();
+    const info = me()!;
+    mod.recordSessionOwner(sid, [info.comm], process.pid);
+    mod.markSessionEnded(sid);
+    expect(mod.isSessionLive(sid)).toBe(false);
+  });
+});
+
+describe("activeWindowMs", () => {
+  const orig = process.env.HIVEMIND_ACTIVE_SESSION_WINDOW_MS;
+  afterAll(() => {
+    if (orig === undefined) delete process.env.HIVEMIND_ACTIVE_SESSION_WINDOW_MS;
+    else process.env.HIVEMIND_ACTIVE_SESSION_WINDOW_MS = orig;
+  });
+
+  it("defaults to 10 minutes when unset", () => {
+    delete process.env.HIVEMIND_ACTIVE_SESSION_WINDOW_MS;
+    expect(mod.activeWindowMs()).toBe(10 * 60 * 1000);
+  });
+
+  it("respects a valid override and ignores invalid values", () => {
+    process.env.HIVEMIND_ACTIVE_SESSION_WINDOW_MS = "120000";
+    expect(mod.activeWindowMs()).toBe(120000);
+    process.env.HIVEMIND_ACTIVE_SESSION_WINDOW_MS = "nope";
+    expect(mod.activeWindowMs()).toBe(10 * 60 * 1000);
+    process.env.HIVEMIND_ACTIVE_SESSION_WINDOW_MS = "-5";
+    expect(mod.activeWindowMs()).toBe(10 * 60 * 1000);
   });
 });
 
@@ -385,13 +586,23 @@ describe("cross-process concurrency", () => {
   // (tryAcquireLock) across processes, so these tests are a real stress test
   // of the lock. Session id comes via env (TEST_SID) because tsx's `-e` flag
   // does not forward positional args reliably across node versions.
-  const modPath = new URL("../../src/hooks/summary-state.ts", import.meta.url).pathname;
+  // A file:// URL is a valid ESM import specifier on every platform; the bare
+  // .pathname form yields "/C:/…" on Windows, which import() rejects.
+  const modUrl = new URL("../../src/hooks/summary-state.ts", import.meta.url).href;
 
+  // Run inline TS in a child WITHOUT a shell: write it to a temp file and
+  // invoke `node --import tsx`. `npx tsx -e <code>` breaks on Windows — npx is
+  // a .cmd needing a shell, and cmd.exe mangles the multi-line code arg
+  // ("Transform failed"). process.execPath is absolute (no shell) and the
+  // script rides a file path (no arg-mangling).
+  let runSeq = 0;
   const runParallel = async (code: string, N: number, sid: string): Promise<string[]> => {
     const runs = Array.from({ length: N }, () =>
       new Promise<string>((resolve, reject) => {
-        const child = spawn("npx", ["tsx", "-e", code], {
-          env: { ...process.env, HOME: tmpHome, TEST_SID: sid },
+        const file = join(tmpHome, `rmw-${runSeq++}.mts`);
+        writeFileSync(file, code);
+        const child = spawn(process.execPath, ["--import", "tsx", file], {
+          env: { ...process.env, HOME: tmpHome, USERPROFILE: tmpHome, TEST_SID: sid },
           stdio: ["ignore", "pipe", "pipe"],
         });
         let out = "";
@@ -407,7 +618,7 @@ describe("cross-process concurrency", () => {
     const sid = newSessionId();
     const N = 8;
     const code =
-      `import("${modPath}").then(m => { ` +
+      `import("${modUrl}").then(m => { ` +
       `  const s = m.bumpTotalCount(process.env.TEST_SID); ` +
       `  process.stdout.write(String(s.totalCount)); ` +
       `});`;
@@ -422,7 +633,7 @@ describe("cross-process concurrency", () => {
     const sid = newSessionId();
     const N = 8;
     const code =
-      `import("${modPath}").then(m => { ` +
+      `import("${modUrl}").then(m => { ` +
       `  process.stdout.write(m.tryAcquireLock(process.env.TEST_SID) ? "1" : "0"); ` +
       `});`;
 
@@ -431,4 +642,88 @@ describe("cross-process concurrency", () => {
     expect(winners).toBe(1);
     mod.releaseLock(sid);
   }, 30_000);
+});
+
+/**
+ * Regression cover for issue #331: a summary run that FAILS never reaches
+ * finalizeSummary, so lastSummaryCount stays 0. Before the back-off, that made
+ * shouldTrigger's first-summary clause true on every subsequent captured
+ * event — one full `claude -p` process per tool call for the rest of the
+ * session (the "flashing console window every 5-6s" on Windows).
+ */
+describe("failed-run back-off (issue #331)", () => {
+  const cfg = { everyNMessages: 50, everyHours: 2 };
+
+  it("retryBackoffMs doubles per failure and caps at 30 minutes", () => {
+    expect(mod.retryBackoffMs(0)).toBe(0);
+    expect(mod.retryBackoffMs(1)).toBe(60_000);
+    expect(mod.retryBackoffMs(2)).toBe(2 * 60_000);
+    expect(mod.retryBackoffMs(3)).toBe(4 * 60_000);
+    expect(mod.retryBackoffMs(5)).toBe(16 * 60_000);
+    expect(mod.retryBackoffMs(6)).toBe(30 * 60_000);
+    expect(mod.retryBackoffMs(99)).toBe(30 * 60_000);
+  });
+
+  it("suppresses the retry while the back-off window is open", () => {
+    const now = Date.now();
+    expect(mod.shouldTrigger(
+      { lastSummaryAt: now, lastSummaryCount: 0, totalCount: 11, lastAttemptAt: now - 30_000, attemptsSinceSuccess: 1 },
+      cfg, now,
+    )).toBe(false);
+  });
+
+  it("allows the retry once the back-off window has elapsed", () => {
+    const now = Date.now();
+    expect(mod.shouldTrigger(
+      { lastSummaryAt: now, lastSummaryCount: 0, totalCount: 11, lastAttemptAt: now - 61_000, attemptsSinceSuccess: 1 },
+      cfg, now,
+    )).toBe(true);
+  });
+
+  it("does not change behavior for a session with no failed attempts", () => {
+    const now = Date.now();
+    expect(mod.shouldTrigger(
+      { lastSummaryAt: now, lastSummaryCount: 0, totalCount: 10, lastAttemptAt: now - 1000, attemptsSinceSuccess: 0 },
+      cfg, now,
+    )).toBe(true);
+  });
+
+  it("collapses a 30-event failing session from 21 spawns down to 1", () => {
+    // Simulate the real loop: every event bumps the counter, and every run we
+    // trigger fails (never calls finalizeSummary, only markSummaryAttempt).
+    const sid = newSessionId();
+    let spawns = 0;
+    for (let i = 0; i < 30; i++) {
+      const state = mod.bumpTotalCount(sid);
+      if (!mod.shouldTrigger(state, cfg)) continue;
+      spawns++;
+      mod.markSummaryAttempt(sid);
+    }
+    expect(spawns).toBe(1);
+  });
+
+  it("markSummaryAttempt stamps the attempt without advancing lastSummaryCount", () => {
+    const sid = newSessionId();
+    for (let i = 0; i < 12; i++) mod.bumpTotalCount(sid);
+    const before = Date.now();
+    mod.markSummaryAttempt(sid);
+    const s = JSON.parse(readFileSync(mod.statePath(sid), "utf-8"));
+    expect(s.attemptsSinceSuccess).toBe(1);
+    expect(s.lastAttemptAt).toBeGreaterThanOrEqual(before);
+    expect(s.lastSummaryCount).toBe(0);
+    expect(s.totalCount).toBe(12);
+    mod.markSummaryAttempt(sid);
+    expect(JSON.parse(readFileSync(mod.statePath(sid), "utf-8")).attemptsSinceSuccess).toBe(2);
+  });
+
+  it("finalizeSummary clears the failure counter so the next run is not delayed", () => {
+    const sid = newSessionId();
+    for (let i = 0; i < 12; i++) mod.bumpTotalCount(sid);
+    mod.markSummaryAttempt(sid);
+    mod.markSummaryAttempt(sid);
+    mod.finalizeSummary(sid, 12);
+    const s = JSON.parse(readFileSync(mod.statePath(sid), "utf-8"));
+    expect(s.attemptsSinceSuccess).toBe(0);
+    expect(mod.shouldTrigger(s, cfg, Date.now() + 3 * 3600 * 1000)).toBe(false);
+  });
 });

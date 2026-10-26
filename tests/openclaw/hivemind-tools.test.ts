@@ -1,32 +1,54 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 /**
- * Integration tests for the three agent-facing memory tools registered by the
- * openclaw hivemind plugin (hivemind_search, hivemind_read, hivemind_index).
+ * Integration tests for the agent-facing tools registered by the openclaw
+ * hivemind plugin:
+ *   - hivemind_search / hivemind_read / hivemind_index (read-side)
+ *   - hivemind_goal_add                              (write-side, team-shared
+ *     goals — openclaw can't intercept Write tool calls so it must
+ *     expose explicit tools instead of the VFS Path A used by claude-code /
+ *     codex; see PR #193 body, section "runtime intercept scope").
  *
- * The tools route through the same search/read primitives the claude-code and
- * codex PreToolUse hooks use, so these tests mock DeeplakeApi at the SQL-query
- * boundary and assert that queries target BOTH the memory (summaries) and
- * sessions (raw turns) tables — the key accuracy gap we're closing.
+ * Tests mock DeeplakeApi at the SQL-query boundary and assert that:
+ *   1. read-side queries target BOTH memory + sessions tables
+ *   2. write-side INSERTs into the goals table under the expected shape
  */
 
 const queryMock = vi.fn();
 const listTablesMock = vi.fn();
 const ensureSessionsTableMock = vi.fn();
 const ensureTableMock = vi.fn();
+const ensureGoalsTableMock = vi.fn();
 const loadConfigMock = vi.fn();
 const loadCredsMock = vi.fn();
+const handleGraphVfsMock = vi.fn();
+
+vi.mock("../../src/graph/vfs-handler.js", () => ({
+  handleGraphVfs: (...args: unknown[]) => handleGraphVfsMock(...args),
+}));
 
 vi.mock("../../src/config.js", () => ({ loadConfig: () => loadConfigMock() }));
 vi.mock("../../src/commands/auth.js", () => ({
   loadCredentials: () => loadCredsMock(),
   saveCredentials: vi.fn(),
-  requestDeviceCode: vi.fn(),
-  pollForToken: vi.fn(),
+  // openclaw's getApi() calls requestAuth() when loadConfig() returns null;
+  // requestAuth uses requestDeviceCode().verification_uri_complete, so return
+  // a stub shape rather than undefined to keep the auth path from crashing
+  // the test ahead of the tool's "Not logged in" early-return.
+  requestDeviceCode: vi.fn().mockResolvedValue({
+    device_code: "dc",
+    user_code: "uc",
+    verification_uri: "http://example/auth",
+    verification_uri_complete: "http://example/auth?code=uc",
+    expires_in: 600,
+    interval: 5,
+  }),
+  pollForToken: vi.fn().mockResolvedValue(null),
   listOrgs: vi.fn().mockResolvedValue([]),
   switchOrg: vi.fn(),
   listWorkspaces: vi.fn().mockResolvedValue([]),
   switchWorkspace: vi.fn(),
+  healDriftedOrgToken: async (creds: unknown) => creds,
 }));
 vi.mock("../../src/deeplake-api.js", () => ({
   DeeplakeApi: class {
@@ -34,6 +56,7 @@ vi.mock("../../src/deeplake-api.js", () => ({
     listTables() { return listTablesMock(); }
     ensureSessionsTable(n: string) { return ensureSessionsTableMock(n); }
     ensureTable() { return ensureTableMock(); }
+    ensureGoalsTable(n: string) { return ensureGoalsTableMock(n); }
   },
 }));
 
@@ -49,7 +72,7 @@ type MockTool = {
 
 async function loadPluginWithTools() {
   vi.resetModules();
-  const mod = await import("../../openclaw/src/index.js");
+  const mod = await import("../../harnesses/openclaw/src/index.js");
   const plugin = mod.default as { register: (api: any) => void };
   const tools: MockTool[] = [];
   const mockApi = {
@@ -65,9 +88,11 @@ async function loadPluginWithTools() {
 
 beforeEach(() => {
   queryMock.mockReset();
+  handleGraphVfsMock.mockReset().mockReturnValue({ kind: "ok", body: "graph hit" });
   listTablesMock.mockReset().mockResolvedValue(["memory", "sessions"]);
   ensureSessionsTableMock.mockReset().mockResolvedValue(undefined);
   ensureTableMock.mockReset().mockResolvedValue(undefined);
+  ensureGoalsTableMock.mockReset().mockResolvedValue(undefined);
   loadCredsMock.mockReset().mockReturnValue({
     token: "tok", orgId: "o", orgName: "acme", userName: "alice",
   });
@@ -80,14 +105,19 @@ beforeEach(() => {
     apiUrl: "http://example",
     tableName: "memory",
     sessionsTableName: "sessions",
+    skillsTableName: "skills",
+    goalsTableName: "hivemind_goals_test",
     memoryPath: "/tmp/mem",
   });
 });
 
 describe("openclaw hivemind tools — registration", () => {
-  it("registers hivemind_search, hivemind_read, hivemind_index when host exposes registerTool", async () => {
+  it("registers read-side + write-side + graph hivemind tools when host exposes registerTool", async () => {
     const { tools } = await loadPluginWithTools();
     expect(tools.map(t => t.name).sort()).toEqual([
+      "hivemind_goal_add",
+      "hivemind_graph_neighborhood",
+      "hivemind_graph_search",
       "hivemind_index",
       "hivemind_read",
       "hivemind_search",
@@ -96,7 +126,7 @@ describe("openclaw hivemind tools — registration", () => {
 
   it("skips tool registration when host does not expose registerTool", async () => {
     vi.resetModules();
-    const mod = await import("../../openclaw/src/index.js");
+    const mod = await import("../../harnesses/openclaw/src/index.js");
     const plugin = mod.default as { register: (api: any) => void };
     let threw: unknown = null;
     try {
@@ -131,9 +161,10 @@ describe("openclaw hivemind tools — registration", () => {
     // ext/openclaw/src/agents/system-prompt.ts buildSkillsSection and
     // skills/skill-contract.ts formatSkillsForPrompt.
     (globalThis as any).__HIVEMIND_SKILL__ = "TEST_SKILL_BODY_CONTENT";
+    (globalThis as any).__HIVEMIND_GRAPH_SKILL__ = "TEST_GRAPH_SKILL_BODY";
     try {
       vi.resetModules();
-      const mod = await import("../../openclaw/src/index.js");
+      const mod = await import("../../harnesses/openclaw/src/index.js");
       const plugin = mod.default as { register: (api: any) => void };
       const onMock = vi.fn();
       plugin.register({
@@ -148,15 +179,18 @@ describe("openclaw hivemind tools — registration", () => {
       const result = await registration![1]({});
       expect(result.prependSystemContext).toContain("TEST_SKILL_BODY_CONTENT");
       expect(result.prependSystemContext).toContain("<hivemind-skill>");
+      expect(result.prependSystemContext).toContain("TEST_GRAPH_SKILL_BODY");
+      expect(result.prependSystemContext).toContain("<hivemind-graph-skill>");
     } finally {
       delete (globalThis as any).__HIVEMIND_SKILL__;
+      delete (globalThis as any).__HIVEMIND_GRAPH_SKILL__;
     }
   });
 
   it("registers memoryCorpusSupplement when host exposes it", async () => {
     const supplementMock = vi.fn();
     vi.resetModules();
-    const mod = await import("../../openclaw/src/index.js");
+    const mod = await import("../../harnesses/openclaw/src/index.js");
     const plugin = mod.default as { register: (api: any) => void };
     plugin.register({
       logger: { info: vi.fn(), error: vi.fn() },
@@ -304,5 +338,91 @@ describe("hivemind_index", () => {
     expect(text).toContain("## sessions");
     expect(text).toContain("[abc](summaries/alice/abc.md)");
     expect(text).toContain("[alice_o_ws_xyz.jsonl](sessions/alice/alice_o_ws_xyz.jsonl)");
+  });
+});
+
+describe("hivemind_goal_add (Path C — write-side via registered tool)", () => {
+  it("INSERTs into the configured goals table with owner from config + opened status", async () => {
+    queryMock.mockResolvedValue([]);
+    const { tools } = await loadPluginWithTools();
+    const goalAdd = tools.find(t => t.name === "hivemind_goal_add")!;
+    const result = await goalAdd.execute("call-goal-1", { text: "ship the goals feature" });
+
+    expect(ensureGoalsTableMock).toHaveBeenCalledWith("hivemind_goals_test");
+    // ensure exactly one INSERT was issued; no chatty pre-SELECT or post-UPDATE
+    const goalInserts = queryMock.mock.calls.filter(c => /INSERT INTO "hivemind_goals_test"/.test(c[0]));
+    expect(goalInserts).toHaveLength(1);
+    const sql = goalInserts[0][0] as string;
+
+    // shape — must include the per-row uuid + goal_id + owner + status + content +
+    // version + created_at + updated_at + agent + plugin_version columns in that order
+    expect(sql).toMatch(/INSERT INTO "hivemind_goals_test" \(id, goal_id, owner, status, content, version, created_at, updated_at, agent, plugin_version\)/);
+    // owner is the userName from the config mock
+    expect(sql).toContain("'alice'");
+    // status is hardcoded to 'opened' for new goals
+    expect(sql).toContain("'opened'");
+    // agent literal must be 'openclaw' so per-agent attribution works
+    expect(sql).toContain("'openclaw'");
+    // content must be E-prefixed (postgres escape-string literal — see CLI parity)
+    expect(sql).toMatch(/E'ship the goals feature'/);
+
+    // result echoes the generated goal_id back to the agent so it can use it
+    // in follow-up calls
+    const text = result.content[0].text;
+    expect(text).toContain("Goal created");
+    expect(text).toContain("owner: alice");
+    expect((result.details as { goal_id: string }).goal_id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it("returns a friendly error and logs when the INSERT throws (e.g. table unreachable)", async () => {
+    queryMock.mockRejectedValue(new Error("connection refused"));
+    const { tools, mockApi } = await loadPluginWithTools();
+    const goalAdd = tools.find(t => t.name === "hivemind_goal_add")!;
+    const result = await goalAdd.execute("call-goal-2", { text: "broken goal" });
+    expect(result.content[0].text).toMatch(/Goal add failed: connection refused/);
+    expect(mockApi.logger.error).toHaveBeenCalled();
+  });
+
+  it("returns 'Not logged in' (no INSERT) when getApi() yields null because config is missing", async () => {
+    loadConfigMock.mockReturnValue(null);
+    const { tools } = await loadPluginWithTools();
+    const goalAdd = tools.find(t => t.name === "hivemind_goal_add")!;
+    const result = await goalAdd.execute("call-goal-3", { text: "x" });
+    expect(result.content[0].text).toMatch(/Not logged in/);
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(ensureGoalsTableMock).not.toHaveBeenCalled();
+  });
+
+  it("safely escapes single quotes in the goal text (SQL injection guard)", async () => {
+    queryMock.mockResolvedValue([]);
+    const { tools } = await loadPluginWithTools();
+    const goalAdd = tools.find(t => t.name === "hivemind_goal_add")!;
+    await goalAdd.execute("call-goal-4", { text: "Levon's goal" });
+    const sql = (queryMock.mock.calls.find(c => /INSERT INTO/.test(c[0]))![0]) as string;
+    // sqlStr() doubles the single quote: 'Levon''s goal'
+    expect(sql).toContain("E'Levon''s goal'");
+  });
+});
+
+describe("hivemind_graph_search", () => {
+  it("queries graph/query/<pattern> via handleGraphVfs", async () => {
+    const { tools } = await loadPluginWithTools();
+    const graphSearch = tools.find(t => t.name === "hivemind_graph_search")!;
+    const result = await graphSearch.execute("call-g1", { pattern: "pushSnapshot" });
+    expect(handleGraphVfsMock).toHaveBeenCalledWith("query/pushSnapshot", expect.any(String));
+    expect(result.content[0].text).toBe("graph hit");
+  });
+});
+
+describe("hivemind_graph_neighborhood", () => {
+  it("queries graph/neighborhood/<file> via handleGraphVfs", async () => {
+    const { tools } = await loadPluginWithTools();
+    const graphNb = tools.find(t => t.name === "hivemind_graph_neighborhood")!;
+    const result = await graphNb.execute("call-g2", { file: "src/hooks/capture.ts" });
+    expect(handleGraphVfsMock).toHaveBeenCalledWith(
+      "neighborhood/src/hooks/capture.ts",
+      expect.any(String),
+    );
+    expect(result.content[0].text).toBe("graph hit");
   });
 });

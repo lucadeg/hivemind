@@ -16,8 +16,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readStdin } from "../../utils/stdin.js";
 import { loadConfig } from "../../config.js";
+import { resolveDirConfig } from "../../dir-config.js";
 import { DeeplakeApi } from "../../deeplake-api.js";
-import { sqlStr } from "../../utils/sql.js";
+import { projectNameFromCwd } from "../../utils/project-name.js";
 import { log as _log } from "../../utils/debug.js";
 import { bundleDirFromImportMeta, spawnCodexWikiWorker, wikiLog } from "./spawn-wiki-worker.js";
 import { forceSessionEndTrigger } from "../../skillify/triggers.js";
@@ -26,6 +27,7 @@ import { buildSessionPath } from "../../utils/session-path.js";
 import { EmbedClient } from "../../embeddings/client.js";
 import { embeddingSqlLiteral } from "../../embeddings/sql.js";
 import { embeddingsDisabled } from "../../embeddings/disable.js";
+import { buildDirectSessionInsertSql } from "../shared/session-insert-sql.js";
 import { getInstalledVersion } from "../../utils/version-check.js";
 
 const log = (msg: string) => _log("codex-stop", msg);
@@ -54,8 +56,11 @@ async function main(): Promise<void> {
   const sessionId = input.session_id;
   if (!sessionId) return;
 
-  const config = loadConfig();
-  if (!config) { log("no config"); return; }
+  const base = loadConfig();
+  if (!base) { log("no config"); return; }
+  const dirRes = resolveDirConfig(base, input.cwd ?? process.cwd());
+  if (!dirRes.collect) { log(`capture disabled for cwd=${input.cwd ?? "?"} via ${dirRes.found?.path}`); return; }
+  const config = dirRes.config;
 
   // 1. Capture the stop event (try to extract last assistant message from transcript)
   if (CAPTURE) {
@@ -113,7 +118,7 @@ async function main(): Promise<void> {
       };
       const line = JSON.stringify(entry);
       const sessionPath = buildSessionPath(config, sessionId);
-      const projectName = (input.cwd ?? "").split("/").pop() || "unknown";
+      const projectName = projectNameFromCwd(input.cwd);
       const filename = sessionPath.split("/").pop() ?? "";
       // For JSONB: only escape single quotes for the SQL literal, keep JSON structure intact.
       // sqlStr() would also escape backslashes and strip control chars, corrupting the JSON.
@@ -126,10 +131,22 @@ async function main(): Promise<void> {
         : await new EmbedClient({ daemonEntry: resolveEmbedDaemonPath() }).embed(line, "document");
       const embeddingSql = embeddingSqlLiteral(embedding);
 
-      const insertSql =
-        `INSERT INTO "${sessionsTable}" (id, path, filename, message, message_embedding, author, size_bytes, project, description, agent, plugin_version, creation_date, last_update_date) ` +
-        `VALUES ('${crypto.randomUUID()}', '${sqlStr(sessionPath)}', '${sqlStr(filename)}', '${jsonForSql}'::jsonb, ${embeddingSql}, '${sqlStr(config.userName)}', ` +
-        `${Buffer.byteLength(line, "utf-8")}, '${sqlStr(projectName)}', 'Stop', 'codex', '${sqlStr(PLUGIN_VERSION)}', '${ts}', '${ts}')`;
+      const insertSql = buildDirectSessionInsertSql(sessionsTable, {
+        // Reuse the event id already embedded in the message JSON so the row PK
+        // matches the payload's id (and keeps the dedup key = the logical event).
+        id: entry.id,
+        sessionPath,
+        filename,
+        jsonForSql,
+        embeddingSql,
+        userName: config.userName,
+        sizeBytes: Buffer.byteLength(line, "utf-8"),
+        projectName,
+        description: "Stop",
+        agent: "codex",
+        pluginVersion: PLUGIN_VERSION,
+        timestamp: ts,
+      });
 
       await api.query(insertSql);
       log("stop event captured");
@@ -144,6 +161,19 @@ async function main(): Promise<void> {
   // Coordinate with the periodic worker: if one is already running for this
   // session, skip. Two workers writing the same summary row trip the
   // Deeplake UPDATE-coalescing quirk (see CLAUDE.md) and drop one write.
+  const cwd = input.cwd || process.cwd();
+
+  // Skillify has its own per-project lock — fire before the wiki-worker lock
+  // check so a Periodic trigger that already holds the lock doesn't suppress
+  // skill mining.
+  forceSessionEndTrigger({
+    config,
+    cwd,
+    bundleDir: bundleDirFromImportMeta(import.meta.url),
+    agent: "codex",
+    sessionId,
+  });
+
   if (!tryAcquireLock(sessionId)) {
     wikiLog(`Stop: periodic worker already running for ${sessionId}, skipping`);
     return;
@@ -154,7 +184,7 @@ async function main(): Promise<void> {
     spawnCodexWikiWorker({
       config,
       sessionId,
-      cwd: input.cwd ?? "",
+      cwd,
       bundleDir: bundleDirFromImportMeta(import.meta.url),
       reason: "Stop",
     });
@@ -170,18 +200,6 @@ async function main(): Promise<void> {
     }
     throw e;
   }
-
-  // Skillify: Codex Stop is the end-of-session signal (no separate SessionEnd
-  // hook). Always force-fire — same shape as Claude Code's SessionEnd path.
-  // The forceSessionEndTrigger helper resets the counter internally so the
-  // mid-session Stop counter doesn't double-fire on the same window.
-  forceSessionEndTrigger({
-    config,
-    cwd: input.cwd ?? "",
-    bundleDir: bundleDirFromImportMeta(import.meta.url),
-    agent: "codex",
-    sessionId,
-  });
 }
 
 main().catch((e) => { log(`fatal: ${e.message}`); process.exit(0); });

@@ -3,6 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
+// Logged paths use the native separator (product builds them with path.join).
+// Compare against join(...) substrings rather than "/"-literal regexes so the
+// assertions hold on Windows too.
+
 // Mock the loadConfig + DeeplakeApi so the pull subcommand can run without
 // hitting the network. The mock returns a fake row from the skills table.
 // loadConfig is a vi.fn so individual tests can swap in null (unauthenticated)
@@ -10,6 +14,9 @@ import { join } from "node:path";
 vi.mock("../../src/config.js", () => ({
   loadConfig: vi.fn(),
 }));
+// Rows a test adds to every SELECT answer (the dedupe tests feed the org table this way).
+const tableRows = vi.hoisted(() => ({ extra: [] as Record<string, unknown>[] }));
+
 vi.mock("../../src/deeplake-api.js", () => ({
   DeeplakeApi: class {
     async query(_sql: string) {
@@ -19,18 +26,21 @@ vi.mock("../../src/deeplake-api.js", () => ({
         scope: "me", author: "alice", description: "d",
         trigger_text: "", source_sessions: "[]", install: "global",
         created_at: "2026-01-01", updated_at: "2026-01-01",
-      }];
+      }, ...tableRows.extra];
     }
   },
 }));
 
 import { runSkillifyCommand } from "../../src/commands/skillify.js";
+import { setFakeHome, clearFakeHome } from "../shared/fake-home.js";
 import { loadConfig } from "../../src/config.js";
+import { recordPull } from "../../src/skillify/manifest.js";
 const loadConfigMock = loadConfig as unknown as ReturnType<typeof vi.fn>;
 
 const VALID_CONFIG = {
   token: "tok", apiUrl: "x", orgId: "org", workspaceId: "ws",
   userName: "tester", skillsTableName: "skills",
+  codebaseTableName: "codebase",
   tableName: "memory", sessionsTableName: "sessions", memoryPath: "/m",
   orgName: "org",
 };
@@ -97,7 +107,7 @@ describe("status (default subcommand)", () => {
     // below would JSON.parse the wrong shape and silently swallow the error.
     const stateHome = mkdtempSync(join(tmpdir(), "skillify-cli-status-"));
     const prevHome = process.env.HOME;
-    process.env.HOME = stateHome;
+    setFakeHome(stateHome);
     try {
       const stateDir = join(stateHome, ".deeplake", "state", "skillify");
       mkdirSync(stateDir, { recursive: true });
@@ -109,8 +119,7 @@ describe("status (default subcommand)", () => {
       expect(out).toMatch(/state: \(no projects tracked yet\)/);
       expect(out).not.toMatch(/project\(s\) tracked/);
     } finally {
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
+      clearFakeHome();
       rmSync(stateHome, { recursive: true, force: true });
     }
   });
@@ -217,7 +226,10 @@ describe("promote", () => {
     process.chdir(dir);
     expectExit(1, () => runSkillifyCommand(["promote", "nonexistent-skill"]));
     expect(erred.join("\n")).toMatch(/not found/);
-    rmSync(dir, { recursive: true, force: true });
+    // Windows can't remove the process cwd and may briefly hold a handle on
+    // the temp dir; chdir out first, then retry-on-EBUSY.
+    process.chdir(originalCwd);
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 });
 
@@ -237,16 +249,20 @@ describe("pull", () => {
   it("--to global is default destination", async () => {
     runSkillifyCommand(["pull", "--dry-run"]);
     await new Promise(r => setImmediate(r));
-    expect(logged.join("\n")).toMatch(/Destination:.*\.claude\/skills/);
+    expect(logged.join("\n")).toContain(join(".claude", "skills"));
   });
 
   it("--to project lands files in cwd/.claude/skills", async () => {
     const dir = mkdtempSync(join(tmpdir(), "skillify-cli-pull-"));
     process.chdir(dir);
+    // Use process.cwd(), not `dir`: on Windows they can differ (8.3 short path
+    // vs long form), and the product builds the destination from cwd.
+    const cwd = process.cwd();
     runSkillifyCommand(["pull", "--to", "project", "--dry-run"]);
     await new Promise(r => setImmediate(r));
-    expect(logged.join("\n")).toMatch(new RegExp(`Destination:\\s+${dir}/.claude/skills`));
-    rmSync(dir, { recursive: true, force: true });
+    expect(logged.join("\n")).toContain(`Destination: ${join(cwd, ".claude", "skills")}`);
+    process.chdir(originalCwd);
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
   it("--user X filters by single author", async () => {
@@ -273,6 +289,52 @@ describe("pull", () => {
     expect(logged.join("\n")).toMatch(/skill='fake-skill'/);
   });
 
+  describe("agent fan-out line", () => {
+    let fanHome: string;
+    beforeEach(() => {
+      fanHome = mkdtempSync(join(tmpdir(), "skillify-cli-fanout-home-"));
+      setFakeHome(fanHome);
+    });
+    afterEach(() => {
+      clearFakeHome();
+      try { rmSync(fanHome, { recursive: true, force: true }); } catch { /* nothing */ }
+    });
+
+    it("global --dry-run names the Codex skills root when codex is installed", async () => {
+      mkdirSync(join(fanHome, ".codex"), { recursive: true });
+      runSkillifyCommand(["pull", "--all-users", "--to", "global", "--dry-run"]);
+      await new Promise(r => setImmediate(r));
+      expect(logged.join("\n")).toContain(`Would link: ${join(fanHome, ".agents", "skills")} (Codex)`);
+    });
+
+    it("global pull names every detected agent root", async () => {
+      mkdirSync(join(fanHome, ".codex"), { recursive: true });
+      mkdirSync(join(fanHome, ".hermes"), { recursive: true });
+      runSkillifyCommand(["pull", "--dry-run"]);
+      await new Promise(r => setImmediate(r));
+      const out = logged.join("\n");
+      expect(out).toContain(`${join(fanHome, ".agents", "skills")} (Codex)`);
+      expect(out).toContain(`${join(fanHome, ".hermes", "skills")} (Hermes)`);
+    });
+
+    it("global pull says no other agent was found", async () => {
+      runSkillifyCommand(["pull", "--dry-run"]);
+      await new Promise(r => setImmediate(r));
+      expect(logged.join("\n")).toMatch(/Would link: none \(no Codex, Hermes or pi install found\)/);
+    });
+
+    it("project pull prints no fan-out line", async () => {
+      mkdirSync(join(fanHome, ".codex"), { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), "skillify-cli-fanout-proj-"));
+      process.chdir(dir);
+      runSkillifyCommand(["pull", "--to", "project", "--dry-run"]);
+      await new Promise(r => setImmediate(r));
+      expect(logged.join("\n")).not.toMatch(/^(Linked|Would link):/m);
+      process.chdir(originalCwd);
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    });
+  });
+
   // Note: validation errors inside pullSkills (e.g. --to weird, --user
   // without value) call process.exit() asynchronously inside a fire-
   // and-forget promise, so they can't be caught from a sync test.
@@ -280,7 +342,167 @@ describe("pull", () => {
   // (buildPullSql, resolvePullDestination).
 });
 
+// ── push ──────────────────────────────────────────────────────────────────
+
+describe("push", () => {
+  // push reads a real local SKILL.md, so each test runs in a temp project dir.
+  // The DeeplakeApi mock returns a fake row (version 1) for the version SELECT,
+  // so a real push bumps to v2; the INSERT response is ignored.
+  let pushDir: string;
+  function writeProjectSkill(name: string): void {
+    const dir = join(process.cwd(), ".claude", "skills", name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "SKILL.md"),
+      [
+        "---",
+        `name: ${name}`,
+        'description: "a pushed skill"',
+        'trigger: "do it"',
+        "author: alice",
+        "version: 1",
+        "created_by_agent: claude_code",
+        "---",
+        "",
+        "## Body",
+      ].join("\n"),
+    );
+  }
+  beforeEach(() => {
+    pushDir = mkdtempSync(join(tmpdir(), "skillify-cli-push-"));
+    process.chdir(pushDir);
+  });
+  afterEach(() => {
+    process.chdir(originalCwd);
+    rmSync(pushDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+
+  it("--dry-run reads the local skill and prints the summary without writing", async () => {
+    writeProjectSkill("demo-skill");
+    runSkillifyCommand(["push", "demo-skill", "--dry-run"]);
+    await new Promise(r => setImmediate(r));
+    const out = logged.join("\n");
+    // The mocked DeeplakeApi returns version 1, so dry-run previews v1 → v2.
+    expect(out).toContain(`Source:      ${join(process.cwd(), ".claude", "skills")}`);
+    expect(out).toMatch(/→ would push\s+demo-skill\s+v1 → v2\s+\(alice, scope=me\)/);
+    expect(out).toContain("Dry run — nothing written to the org skills table.");
+  });
+
+  it("real push reports the published version (remote v1 → v2)", async () => {
+    writeProjectSkill("demo-skill");
+    runSkillifyCommand(["push", "demo-skill"]);
+    await new Promise(r => setImmediate(r));
+    const out = logged.join("\n");
+    expect(out).toMatch(/✓ pushed\s+demo-skill\s+v1 → v2\s+\(alice, scope=me\)/);
+    expect(out).toContain("Pushed to org skills table as version 2. Teammates get it on next `hivemind skillify pull`.");
+  });
+
+  it("missing local skill surfaces the exact 'not found' path error and exits 1", async () => {
+    runSkillifyCommand(["push", "no-such-skill"]);
+    await new Promise(r => setImmediate(r));
+    const expectedPath = join(process.cwd(), ".claude", "skills", "no-such-skill", "SKILL.md");
+    expect(erred.join("\n")).toContain(`push error: skill 'no-such-skill' not found at ${expectedPath}`);
+  });
+
+  it("invalid --from is rejected with the exact message", async () => {
+    writeProjectSkill("demo-skill");
+    runSkillifyCommand(["push", "demo-skill", "--from", "weird"]);
+    await new Promise(r => setImmediate(r));
+    expect(erred.join("\n")).toContain("Invalid --from 'weird'. Use 'project' or 'global'.");
+  });
+
+  it("missing skill name is rejected with the exact usage line", async () => {
+    runSkillifyCommand(["push"]);
+    await new Promise(r => setImmediate(r));
+    expect(erred.join("\n")).toContain("Usage: hivemind skillify push <skill-name> [--from project|global] [--dry-run]");
+  });
+
+  it("requires login with the exact message", async () => {
+    loadConfigMock.mockReturnValue(null);
+    runSkillifyCommand(["push", "demo-skill"]);
+    await new Promise(r => setImmediate(r));
+    expect(erred.join("\n")).toContain("Not logged in. Run: hivemind login");
+  });
+});
+
 // ── unpull ────────────────────────────────────────────────────────────────
+
+describe("dedupe", () => {
+  let dedupeHome: string;
+  beforeEach(() => {
+    dedupeHome = mkdtempSync(join(tmpdir(), "skillify-cli-dedupe-home-"));
+    setFakeHome(dedupeHome);
+  });
+  afterEach(() => {
+    clearFakeHome();
+    tableRows.extra.length = 0;
+    try { rmSync(dedupeHome, { recursive: true, force: true }); } catch { /* nothing */ }
+  });
+
+  function writeDedupeFixture(): string {
+    const root = join(dedupeHome, ".claude", "skills");
+    for (const dir of ["deploy", "deploy--tester"]) {
+      mkdirSync(join(root, dir), { recursive: true });
+      writeFileSync(join(root, dir, "SKILL.md"), "---\nname: deploy\nauthor: tester\nversion: 2\n---\n\nbody\n");
+    }
+    recordPull({
+      dirName: "deploy--tester", name: "deploy", author: "tester", projectKey: "pk", remoteVersion: 2,
+      install: "global", installRoot: root, pulledAt: "2026", symlinks: [],
+    });
+    return root;
+  }
+
+  it("--dry-run lists the caller's own <name>--<me> copy and keeps it on disk", async () => {
+    const root = writeDedupeFixture();
+    runSkillifyCommand(["dedupe", "--dry-run"]);
+    await new Promise(r => setImmediate(r));
+    const out = logged.join("\n");
+    expect(out).toMatch(/→ would remove\s+deploy--tester/);
+    expect(out).toMatch(/Result: 1 to fix, 0 kept\./);
+    expect(existsSync(join(root, "deploy--tester"))).toBe(true);
+  });
+
+  function tableRow(author: string, version: number): Record<string, unknown> {
+    return {
+      name: "deploy", project: "p", project_key: "pk", body: `${author} body`, version, source_agent: "x",
+      scope: "me", author, contributors: JSON.stringify([author]), description: "d", trigger_text: "",
+      source_sessions: "[]", install: "global", created_at: "2026-01-01", updated_at: "2026-01-01",
+    };
+  }
+
+  it("--dry-run lists a same-name skill of two authors in the org table as a merge, with no local skill at all", async () => {
+    tableRows.extra.push(tableRow("tester", 2), tableRow("bob", 1));
+    runSkillifyCommand(["dedupe", "--dry-run"]);
+    await new Promise(r => setImmediate(r));
+    const out = logged.join("\n");
+    expect(out).toMatch(/Org table:\s+skills \(workspace ws\)/);
+    expect(out).toMatch(/→ would merge\s+deploy\s+\(authors bob, tester -> tester v3 · no local copy\)/);
+    expect(out).toMatch(/Result: 1 to fix, 0 kept\./);
+    expect(existsSync(join(dedupeHome, ".claude", "skills"))).toBe(false);
+  });
+
+  it("--dry-run lists a same-name skill of another author as a merge; --no-merge does not", async () => {
+    const root = writeDedupeFixture();
+    mkdirSync(join(root, "deploy--bob"), { recursive: true });
+    writeFileSync(join(root, "deploy--bob", "SKILL.md"), "---\nname: deploy\nauthor: bob\nversion: 1\n---\n\nbob body\n");
+    recordPull({
+      dirName: "deploy--bob", name: "deploy", author: "bob", projectKey: "pk", remoteVersion: 1,
+      install: "global", installRoot: root, pulledAt: "2026", symlinks: [],
+    });
+    tableRows.extra.push(tableRow("tester", 2), tableRow("bob", 1));
+    runSkillifyCommand(["dedupe", "--dry-run"]);
+    await new Promise(r => setImmediate(r));
+    expect(logged.join("\n")).toMatch(/→ would merge\s+deploy\s+\(authors bob, tester -> tester v3 · local copy updated\)/);
+    expect(logged.join("\n")).toMatch(/Result: 2 to fix, 0 kept\./);
+
+    logged.length = 0;
+    runSkillifyCommand(["dedupe", "--dry-run", "--no-merge"]);
+    await new Promise(r => setImmediate(r));
+    expect(logged.join("\n")).not.toMatch(/would merge/);
+    expect(logged.join("\n")).toMatch(/Result: 1 to fix, 0 kept\./);
+    expect(existsSync(join(root, "deploy--bob"))).toBe(true);
+  });
+});
 
 describe("unpull", () => {
   // Each test runs under a fresh HOME so the manifest writes by
@@ -290,12 +512,11 @@ describe("unpull", () => {
   beforeEach(() => {
     unpullHome = mkdtempSync(join(tmpdir(), "skillify-cli-unpull-home-"));
     originalHome = process.env.HOME;
-    process.env.HOME = unpullHome;
+    setFakeHome(unpullHome);
   });
   afterEach(() => {
     try { rmSync(unpullHome, { recursive: true, force: true }); } catch { /* nothing */ }
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    clearFakeHome();
   });
 
   it("--dry-run on empty manifest reports zero work", () => {
@@ -338,9 +559,12 @@ describe("unpull", () => {
   it("--to project scopes the scanning root to cwd", () => {
     const dir = mkdtempSync(join(tmpdir(), "skillify-cli-unpull-proj-"));
     process.chdir(dir);
+    // process.cwd(), not `dir`: they can differ on Windows (short vs long path).
+    const cwd = process.cwd();
     runSkillifyCommand(["unpull", "--to", "project", "--dry-run"]);
-    expect(logged.join("\n")).toMatch(new RegExp(`Scanning:\\s+${dir}/.claude/skills`));
-    rmSync(dir, { recursive: true, force: true });
+    expect(logged.join("\n")).toContain(join(cwd, ".claude", "skills"));
+    process.chdir(originalCwd);
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
   it("--to with invalid value reports error", async () => {

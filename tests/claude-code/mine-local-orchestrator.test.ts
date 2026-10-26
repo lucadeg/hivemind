@@ -86,7 +86,10 @@ const resolveSkillsRoot = vi.fn();
 const writeNewSkill = vi.fn();
 const listSkills = vi.fn();
 const parseFrontmatter = vi.fn();
-vi.mock("../../src/skillify/skill-writer.js", () => ({
+vi.mock("../../src/skillify/skill-writer.js", async (orig) => ({
+  // Keep the real module (capSkillName etc.) and override only what these
+  // orchestrator tests need to spy on.
+  ...(await orig<typeof import("../../src/skillify/skill-writer.js")>()),
   resolveSkillsRoot: (...args: any[]) => resolveSkillsRoot(...args),
   writeNewSkill: (...args: any[]) => writeNewSkill(...args),
   listSkills: (...args: any[]) => listSkills(...args),
@@ -160,6 +163,7 @@ describe("runMineLocal: orchestrator branches", () => {
     writeLocalManifest.mockImplementation(() => {});
     writeNewSkill.mockImplementation((opts: any) => ({
       path: join(opts.skillsRoot, opts.name, "SKILL.md"),
+      name: opts.name,
       createdAt: "2026-05-15T00:00:00Z",
     }));
 
@@ -235,6 +239,18 @@ describe("runMineLocal: orchestrator branches", () => {
     await mod.runMineLocal([]);
 
     expect(spawnCalls).toHaveLength(1);
+    // The gate prompt offers the model a verdict path inside the per-session
+    // tmp dir, which is outside the session cwd. That dir must be granted by
+    // name: `bypassPermissions` is silently ignored under an enterprise policy
+    // (disableBypassPermissionsMode), and the child then refuses the path.
+    expect(spawnCalls[0].args).not.toContain("--permission-mode");
+    expect(spawnCalls[0].args).not.toContain("bypassPermissions");
+    // Pin the granted VALUES: the dir must be THIS session's tmp dir (the one
+    // holding the verdict path named in the prompt), not merely some dir.
+    const addDirAt = spawnCalls[0].args.indexOf("--add-dir");
+    expect(addDirAt).toBeGreaterThan(-1);
+    expect(spawnCalls[0].args[addDirAt + 1]).toMatch(/[/\\]mine-local-\d+[/\\]s-sess-aaa$/);
+    expect(spawnCalls[0].args.slice(addDirAt + 2)).toEqual(["--allowedTools", "Read", "Write"]);
     expect(writeNewSkill).toHaveBeenCalledTimes(1);
     expect(writeNewSkill.mock.calls[0][0].name).toBe("useful-skill");
     expect(fanOutSymlinks).toHaveBeenCalledTimes(1);
@@ -452,6 +468,39 @@ describe("runMineLocal: orchestrator branches", () => {
     expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("mine-local v1 requires the Claude Code CLI"));
   });
 
+  it("--only <agent> filters detectInstalledAgents to the requested agent", async () => {
+    // codex PR #198 P2 regression guard: the install-time scan
+    // advertises "scan your Claude Code sessions" but mine-local
+    // walks every installed agent by default. The --only flag scopes
+    // the picker so the prompt copy is honest.
+    const old = Date.now() - 5 * 60_000;
+    detectInstalledAgents.mockReturnValueOnce([
+      { agent: "codex", sessionRoot: "/c", encodeCwd: () => "x" },
+      { agent: "claude_code", sessionRoot: "/cc", encodeCwd: () => "x" },
+    ]);
+    // listLocalSessions should be called with ONLY the claude_code
+    // install when --only claude_code is passed.
+    listLocalSessions.mockImplementationOnce((installs: any) => {
+      expect(installs).toHaveLength(1);
+      expect(installs[0].agent).toBe("claude_code");
+      return [makeSession("a", old, "claude_code")];
+    });
+    const mod = await importOrch();
+    await mod.runMineLocal(["--only", "claude_code", "--dry-run"]);
+    // Confirm the log mentions the filter so users can see what
+    // happened.
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("filtered to claude_code"));
+  });
+
+  it("--only <agent> with no matching install → exit 1 with clear error", async () => {
+    detectInstalledAgents.mockReturnValueOnce([
+      { agent: "codex", sessionRoot: "/c", encodeCwd: () => "x" },
+    ]);
+    const mod = await importOrch();
+    await expect(mod.runMineLocal(["--only", "claude_code"])).rejects.toThrow("__exit_1__");
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("No 'claude_code' session directory detected"));
+  });
+
   it("host = codex but claude_code installed → mining uses claude_code as gate", async () => {
     const old = Date.now() - 5 * 60_000;
     detectHostAgent.mockReturnValueOnce("codex");
@@ -536,6 +585,7 @@ describe("runGateViaStdin error branches via orchestrator", () => {
     writeLocalManifest.mockImplementation(() => {});
     writeNewSkill.mockImplementation((opts: any) => ({
       path: join(opts.skillsRoot, opts.name, "SKILL.md"),
+      name: opts.name,
       createdAt: "2026-05-15T00:00:00Z",
     }));
     exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
@@ -608,6 +658,7 @@ describe("happy-path with already-existing skill check (loadExistingSummaries)",
     writeLocalManifest.mockImplementation(() => {});
     writeNewSkill.mockImplementation((opts: any) => ({
       path: join(opts.skillsRoot, opts.name, "SKILL.md"),
+      name: opts.name,
       createdAt: "2026-05-15T00:00:00Z",
     }));
 

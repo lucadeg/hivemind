@@ -7,11 +7,14 @@
  * Invoked by stop.ts as: node wiki-worker.js <config.json>
  */
 
-import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, utimesSync, appendFileSync, mkdirSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { buildTrailingPromptInvocation } from "../wiki-worker-spawn.js";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { finalizeSummary, releaseLock } from "../summary-state.js";
+import { finalizeSummary, releaseLock, readState } from "../summary-state.js";
+import { capLinesByBytes, markSummaryUnwritten, newRowsFromWindow, stampOffset, summaryWasWritten, WIKI_FALLBACK_MAX_ROWS, WIKI_JSONL_MAX_BYTES } from "../wiki-offset.js";
+import { redactSecrets } from "../shared/redact.js";
 import { uploadSummary } from "../upload-summary.js";
 import { log as _log } from "../../utils/debug.js";
 import { EmbedClient } from "../../embeddings/client.js";
@@ -104,24 +107,55 @@ function cleanup(): void {
   }
 }
 
+function tailText(text: string, maxChars = 240): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length <= maxChars ? compact : `…${compact.slice(-maxChars)}`;
+}
+
+function formatExecFailure(error: any): string {
+  const parts: string[] = [];
+  if (error?.code) parts.push(`code=${error.code}`);
+  if (error?.status !== undefined && error?.status !== null) parts.push(`status=${error.status}`);
+  if (error?.signal) parts.push(`signal=${error.signal}`);
+  if (error?.message) parts.push(`message=${tailText(String(error.message))}`);
+  const stderr = Buffer.isBuffer(error?.stderr)
+    ? error.stderr.toString("utf-8")
+    : typeof error?.stderr === "string"
+      ? error.stderr
+      : "";
+  if (stderr.trim()) parts.push(`stderr=${tailText(stderr)}`);
+  const stdout = Buffer.isBuffer(error?.stdout)
+    ? error.stdout.toString("utf-8")
+    : typeof error?.stdout === "string"
+      ? error.stdout
+      : "";
+  if (stdout.trim()) parts.push(`stdout=${tailText(stdout)}`);
+  return parts.length > 0 ? parts.join(", ") : "unknown failure";
+}
+
 async function main(): Promise<void> {
   try {
-    // 1. Fetch session events from sessions table
+    // 1. Fetch session events from the sessions table — BOUNDED to the newest
+    // WIKI_FALLBACK_MAX_ROWS rows (reversed to chronological) plus the true
+    // total. The old unbounded `ORDER BY ASC` materialized the whole fat
+    // `message` column (tens of MB, ~30s cold on a mega-session) even though
+    // only the newest un-summarized rows are consumed. `count(*)` reads no fat
+    // column, so `total` is cheap and keeps the offset math + stamped offset right.
     wlog("fetching session events");
-    const rows = await query(
-      `SELECT message, creation_date FROM "${cfg.sessionsTable}" ` +
-      `WHERE path LIKE E'${esc(`/sessions/%${cfg.sessionId}%`)}' ORDER BY creation_date ASC`
-    );
-
-    if (rows.length === 0) {
+    const likePat = esc(`/sessions/%${cfg.sessionId}%`);
+    const cntRows = await query(`SELECT count(*) AS n FROM "${cfg.sessionsTable}" WHERE path LIKE E'${likePat}'`);
+    const total = Number(cntRows[0]?.["n"] ?? 0);
+    if (total === 0) {
       wlog("no session events found — exiting");
       return;
     }
+    const fetched = await query(
+      `SELECT message, creation_date FROM "${cfg.sessionsTable}" ` +
+      `WHERE path LIKE E'${likePat}' ORDER BY creation_date DESC LIMIT ${WIKI_FALLBACK_MAX_ROWS}`
+    );
+    const rows = fetched.reverse();
 
-    const jsonlContent = rows
-      .map(r => typeof r.message === "string" ? r.message : JSON.stringify(r.message))
-      .join("\n");
-    const jsonlLines = rows.length;
+    const jsonlLines = total;
 
     const pathRows = await query(
       `SELECT DISTINCT path FROM "${cfg.sessionsTable}" ` +
@@ -131,11 +165,14 @@ async function main(): Promise<void> {
       ? pathRows[0].path as string
       : `/sessions/unknown/${cfg.sessionId}.jsonl`;
 
-    writeFileSync(tmpJsonl, jsonlContent);
-    wlog(`found ${jsonlLines} events at ${jsonlServerPath}`);
-
-    // 2. Check for existing summary (resumed session)
+    // 2. Determine how many rows were already summarized (resumed session).
+    // The sidecar count is authoritative: finalizeSummary writes it after every
+    // successful run and it never depends on the LLM echoing a bookkeeping line
+    // back into the summary. The regex over the stored summary is only a
+    // fallback for a session first summarized on another machine (the sidecar
+    // lives under ~/.claude/hooks and does not travel).
     let prevOffset = 0;
+    let hasExistingSummary = false;
     try {
       const sumRows = await query(
         `SELECT summary FROM "${cfg.memoryTable}" ` +
@@ -146,9 +183,48 @@ async function main(): Promise<void> {
         const match = existing.match(/\*\*JSONL offset\*\*:\s*(\d+)/);
         if (match) prevOffset = parseInt(match[1], 10);
         writeFileSync(tmpSummary, existing);
-        wlog(`existing summary found, offset=${prevOffset}`);
+        hasExistingSummary = true;
       }
-    } catch { /* no existing summary */ }
+    } catch (e: any) {
+      // A genuine lookup failure (query() throws only after its own retries) is
+      // NOT the same as "no summary". Treating it as absent would slice to the
+      // newest rows and overwrite the canonical summary with a base-less one, so
+      // bail and retry on the next run instead.
+      wlog(`existing summary lookup failed: ${e.message}; skipping to avoid overwriting the base summary`);
+      return;
+    }
+    // The offset only means something if we actually loaded the summary it
+    // refers to. If the summary row is gone (or the read failed), slicing by a
+    // stale sidecar count would drop old rows with no base summary to extend,
+    // then overwrite the canonical summary with tail-only content. No base ⇒
+    // regenerate from scratch.
+    if (!hasExistingSummary) {
+      prevOffset = 0;
+    } else {
+      const sidecarCount = readState(cfg.sessionId)?.lastSummaryCount ?? 0;
+      if (sidecarCount > prevOffset) prevOffset = sidecarCount;
+    }
+
+    // Feed codex only the rows added since the last summary. Reprocessing the
+    // full session on every run is what drove the ENOBUFS / 120s-timeout
+    // failures on long (4000+ event) sessions — a stuck offset meant every run
+    // re-summarized everything from scratch.
+    const newRows = newRowsFromWindow(rows, total, prevOffset);
+    if (prevOffset > 0 && newRows.length === 0) {
+      wlog(`no new events since last summary (offset=${prevOffset}, total=${jsonlLines}) — skipping`);
+      return;
+    }
+    const newLines = newRows.map(r => typeof r.message === "string" ? r.message : JSON.stringify(r.message));
+    const { kept, dropped, truncated } = capLinesByBytes(newLines, WIKI_JSONL_MAX_BYTES);
+    if (dropped > 0) {
+      wlog(`new rows exceed ${WIKI_JSONL_MAX_BYTES}B — summarizing newest ${kept.length}, permanently skipping ${dropped} older rows`);
+    }
+    if (truncated) {
+      wlog(`a single event exceeded ${WIKI_JSONL_MAX_BYTES}B — truncated it to stay within the buffer`);
+    }
+
+    writeFileSync(tmpJsonl, kept.join("\n"));
+    wlog(`found ${jsonlLines} events (${kept.length} new since offset ${prevOffset}) at ${jsonlServerPath}`);
 
     // 3. Build prompt and run codex exec
     const prompt = cfg.promptTemplate
@@ -161,25 +237,54 @@ async function main(): Promise<void> {
       .replace(/__JSONL_SERVER_PATH__/g, jsonlServerPath);
 
     wlog("running codex exec");
+    let execSucceeded = false;
+    const summaryBeforeExec = existsSync(tmpSummary) ? readFileSync(tmpSummary, "utf-8") : null;
+    const summaryBaseline = markSummaryUnwritten(tmpSummary, { existsSync, utimesSync, statSync });
     try {
-      execFileSync(cfg.codexBin, [
+      const inv = buildTrailingPromptInvocation(cfg.codexBin, [
         "exec",
         "--dangerously-bypass-approvals-and-sandbox",
-        prompt,
-      ], {
-        stdio: ["ignore", "pipe", "pipe"],
+      ], prompt);
+      execFileSync(inv.file, inv.args, {
+        ...inv.options,
         timeout: 120_000,
+        // codex exec streams its reasoning to stdout, which execFileSync
+        // buffers. The Node default (1 MB) overflows to ENOBUFS on a verbose
+        // run, killing the summary. The summary is written to a file, not read
+        // from stdout, so we only need headroom to drain it.
+        maxBuffer: 64 * 1024 * 1024,
         env: { ...process.env, HIVEMIND_WIKI_WORKER: "1", HIVEMIND_CAPTURE: "false" },
       });
+      execSucceeded = true;
       wlog("codex exec exited (code 0)");
     } catch (e: any) {
-      wlog(`codex exec failed: ${e.status ?? e.message}`);
+      const detail = formatExecFailure(e);
+      wlog(`codex exec failed: ${detail}`);
     }
 
     // 4. Upload summary to memory table
     if (existsSync(tmpSummary)) {
-      const text = readFileSync(tmpSummary, "utf-8");
-      if (text.trim()) {
+      const raw = readFileSync(tmpSummary, "utf-8");
+      const summaryChanged = summaryBeforeExec === null ? raw.trim().length > 0 : raw !== summaryBeforeExec;
+      if (!execSucceeded) {
+        wlog(summaryChanged
+          ? "codex exec failed after a partial summary write; skipping upload to avoid advancing the offset"
+          : "codex exec failed without producing a new summary; skipping upload");
+        return;
+      }
+      // Exit 0 is not proof of work: a child that cannot reach tmpDir (or simply
+      // declines) exits 0 having written nothing, leaving the pre-seeded base
+      // summary in place. Uploading it unchanged would still advance the offset
+      // and slice those events away forever, which is how a session gets stuck
+      // as a header-only placeholder run after run.
+      if (!summaryWasWritten(tmpSummary, summaryBaseline, summaryChanged, { statSync })) {
+        wlog("codex exec exited 0 but never wrote the summary; skipping upload to avoid advancing the offset");
+        return;
+      }
+      if (raw.trim()) {
+        // Stamp the offset ourselves so the persisted summary is authoritative
+        // and never depends on the LLM echoing the bookkeeping line.
+        const text = redactSecrets(stampOffset(raw, jsonlLines));
         const fname = `${cfg.sessionId}.md`;
         const vpath = `/summaries/${cfg.userName}/${fname}`;
         // Embed the summary so it ranks in the semantic retrieval branch.

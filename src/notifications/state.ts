@@ -13,12 +13,13 @@
  * accidental absolute-path injection cannot reach the real ~/.deeplake/.
  */
 
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { NotificationsState, Notification } from "./types.js";
 import { log as _log } from "../utils/debug.js";
+import { isPathInsideHome, renameAtomic } from "../utils/atomic-write.js";
 
 const log = (msg: string) => _log("notifications-state", msg);
 
@@ -36,27 +37,47 @@ export function readState(): NotificationsState {
       log(`state malformed → treating as empty`);
       return { shown: {} };
     }
-    return { shown: { ...parsed.shown } };
+    return {
+      shown: { ...parsed.shown },
+      sessionCount: typeof parsed.sessionCount === "number" ? parsed.sessionCount : undefined,
+      lastCountedSessionId: typeof parsed.lastCountedSessionId === "string" ? parsed.lastCountedSessionId : undefined,
+    };
   } catch {
     return { shown: {} };
   }
 }
 
+// bumpSessionCount advances the persisted session counter once per session and
+// returns the new count. Deduped by session_id so the two parallel SessionStart
+// fires (settings.json + marketplace hooks.json) don't double-count. A missing
+// session_id leaves the count unchanged (can't dedup safely).
+export function bumpSessionCount(sessionId?: string): number {
+  const state = readState();
+  const current = state.sessionCount ?? 0;
+  if (!sessionId || state.lastCountedSessionId === sessionId) {
+    return current;
+  }
+  const next = current + 1;
+  writeState({ ...state, sessionCount: next, lastCountedSessionId: sessionId });
+  return next;
+}
+
 export function writeState(state: NotificationsState): void {
   const path = statePath();
   const home = resolve(homedir());
-  if (!resolve(path).startsWith(home + "/") && resolve(path) !== home) {
+  if (!isPathInsideHome(path, home)) {
     // Sandbox guard — never write outside the user's HOME.
     throw new Error(`notifications-state write blocked: ${path} is outside ${home}`);
   }
   mkdirSync(join(home, ".deeplake"), { recursive: true, mode: 0o700 });
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
-  renameSync(tmp, path);
+  renameAtomic(tmp, path);
 }
 
 export function markShown(state: NotificationsState, n: Notification, now: Date = new Date()): NotificationsState {
   return {
+    ...state,
     shown: {
       ...state.shown,
       [n.id]: { dedupKey: JSON.stringify(n.dedupKey), shownAt: now.toISOString() },
@@ -100,9 +121,7 @@ export function tryClaim(n: Notification): boolean {
     log(`tryClaim mkdir failed: ${e?.message ?? String(e)}`);
     return true;
   }
-  const keyHash = createHash("sha256").update(JSON.stringify(n.dedupKey)).digest("hex").slice(0, 12);
-  const safeId = n.id.replace(/[^a-zA-Z0-9_.:-]/g, "_");
-  const claimPath = join(claimsDir, `${safeId}-${keyHash}`);
+  const claimPath = claimPathFor(claimsDir, n);
   try {
     const fd = openSync(claimPath, "wx", 0o600);
     closeSync(fd);
@@ -112,4 +131,37 @@ export function tryClaim(n: Notification): boolean {
     log(`tryClaim open failed: ${e?.message ?? String(e)}`);
     return true;
   }
+}
+
+/**
+ * Release a claim by unlinking the claim file. Called after a transient
+ * notification is delivered so the NEXT session's enqueue+drain can win a
+ * fresh claim. Non-transient notifications keep their claim files
+ * (matching the persistent state.shown contract — same (id, dedupKey)
+ * pair won't be re-emitted later).
+ *
+ * Best-effort: any unlink error is swallowed. A stale claim file just
+ * means the next session-start drain skips that notification, which is
+ * the existing fail-OPEN posture taken elsewhere in this module.
+ */
+export function releaseClaim(n: Notification): void {
+  const home = resolve(homedir());
+  const claimsDir = join(home, ".deeplake", "notifications-claims");
+  const claimPath = claimPathFor(claimsDir, n);
+  try {
+    unlinkSync(claimPath);
+  } catch (e: any) {
+    if (e?.code !== "ENOENT") {
+      log(`releaseClaim unlink failed: ${e?.message ?? String(e)}`);
+    }
+  }
+}
+
+function claimPathFor(claimsDir: string, n: Notification): string {
+  const keyHash = createHash("sha256").update(JSON.stringify(n.dedupKey)).digest("hex").slice(0, 12);
+  // Exclude ':' — it's a valid POSIX filename char but illegal on Windows
+  // (drive separator), so a claim file with ':' in the name can't be created
+  // there and tryClaim would fail open on every call.
+  const safeId = n.id.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  return join(claimsDir, `${safeId}-${keyHash}`);
 }

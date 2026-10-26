@@ -12,13 +12,17 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   appendQueuedSessionRow,
+  appendQueuedSessionRows,
   buildQueuedSessionRow,
   buildSessionInsertSql,
   buildSessionPath,
   clearSessionWriteDisabled,
   drainSessionQueues,
   flushSessionQueue,
+  gcOversizedQueueFiles,
   isSessionWriteDisabled,
+  MAX_SESSION_QUEUE_BYTES,
+  queuedRowBytes,
   isSessionWriteAuthError,
   markSessionWriteDisabled,
   type QueuedSessionRow,
@@ -87,7 +91,7 @@ describe("session queue", () => {
     const queueDir = makeQueueDir();
     const row = makeRow("session-append", 1);
 
-    const queuePath = appendQueuedSessionRow(row, queueDir);
+    const { queuePath } = appendQueuedSessionRow(row, queueDir);
     const lines = readFileSync(queuePath, "utf-8").trim().split("\n");
 
     expect(lines).toHaveLength(1);
@@ -107,6 +111,23 @@ describe("session queue", () => {
     expect(sql).toContain('"path":"C:');
     expect(sql).toContain("file.ts");
     expect(sql).toContain("), (");
+  });
+
+  it("builds an idempotent batch insert (anti-join, not a bare VALUES insert)", () => {
+    // C1: the sessions table has no UNIQUE constraint on id, so a flush that
+    // re-sends the batch after a transient 5xx must not duplicate rows. The
+    // builder emits INSERT ... SELECT ... FROM (VALUES ...) v WHERE NOT EXISTS
+    // (id = v.id) — the multi-row equivalent of the single-row capture guard.
+    const sql = buildSessionInsertSql("sessions", [makeRow("s", 1), makeRow("s", 2)]);
+    const cols =
+      "id, path, filename, message, author, size_bytes, project, description, agent, plugin_version, creation_date, last_update_date";
+    expect(sql).toContain(`INSERT INTO "sessions" (${cols})`);
+    expect(sql).toContain(`) AS v(${cols})`);
+    expect(sql).toContain(
+      `WHERE NOT EXISTS (SELECT 1 FROM "sessions" AS t WHERE t.id = v.id)`,
+    );
+    // ...and never the duplicate-prone `) VALUES (` form directly after the column list.
+    expect(sql).not.toContain(`${cols}) VALUES (`);
   });
 
   it("wraps malformed messages in a valid JSON object before casting to jsonb", () => {
@@ -575,5 +596,85 @@ describe("session queue", () => {
     reclaimed?.();
     expect(existsSync(join(queueDir, ".sessions.drain.lock"))).toBe(false);
     release?.();
+  });
+});
+
+describe("oversized queue files", () => {
+  it("rejects an append that would push the file past the ceiling", () => {
+    const queueDir = makeQueueDir();
+    const { queuePath } = appendQueuedSessionRow(makeRow("s-edge", 0), queueDir);
+    const existing = readFileSync(queuePath, "utf-8");
+
+    // Ceiling one byte above the current size: the file is below the limit,
+    // but the next row crosses it, so the file must be left byte-identical.
+    appendQueuedSessionRow(makeRow("s-edge", 1), queueDir, existing.length + 1);
+    expect(readFileSync(queuePath, "utf-8")).toBe(existing);
+  });
+
+  it("stops appending once the queue file reaches the size ceiling", () => {
+    const queueDir = makeQueueDir();
+    const { queuePath } = appendQueuedSessionRow(makeRow("s-cap", 0), queueDir, 10_000);
+    const afterFirst = readFileSync(queuePath, "utf-8");
+
+    // Simulate a queue that has already reached the ceiling.
+    writeFileSync(queuePath, "x".repeat(10_000));
+    appendQueuedSessionRow(makeRow("s-cap", 1), queueDir, 10_000);
+    expect(readFileSync(queuePath, "utf-8").length).toBe(10_000);
+
+    // Below the ceiling it appends as usual.
+    writeFileSync(queuePath, afterFirst);
+    appendQueuedSessionRow(makeRow("s-cap", 2), queueDir, 10_000);
+    expect(readFileSync(queuePath, "utf-8").split("\n").filter(Boolean)).toHaveLength(2);
+  });
+
+  it("drops queue and inflight files past the ceiling and leaves the rest alone", () => {
+    const queueDir = makeQueueDir();
+    const { queuePath: small } = appendQueuedSessionRow(makeRow("s-small", 0), queueDir);
+    const big = join(queueDir, "s-big.jsonl");
+    const bigInflight = join(queueDir, "s-big-2.inflight");
+    const atCeiling = join(queueDir, "s-exact.jsonl");
+    const journal = join(queueDir, ".dropped-rows.jsonl");
+    writeFileSync(journal, "x".repeat(9000));
+    writeFileSync(big, "x".repeat(4097));
+    writeFileSync(bigInflight, "x".repeat(5000));
+    writeFileSync(atCeiling, "x".repeat(4096));
+
+    const losses: Array<[string, number]> = [];
+    const reclaimed = gcOversizedQueueFiles(queueDir, 4096, (path, size) => losses.push([path, size]));
+
+    expect(reclaimed).toBe(9097);
+    // The caller is told exactly what was thrown away, so the loss can be
+    // recorded durably instead of only in a debug log.
+    expect(losses.sort()).toEqual([[big, 4097], [bigInflight, 5000]].sort());
+    expect(existsSync(big)).toBe(false);
+    expect(existsSync(bigInflight)).toBe(false);
+    // A file sitting exactly at the ceiling is legitimate — appends stop there,
+    // so it still holds rows the backend has not taken. It must survive.
+    expect(existsSync(atCeiling)).toBe(true);
+    expect(existsSync(small)).toBe(true);
+    // Dot-prefixed entries are queue metadata, not rows owed to the backend —
+    // GC must never collect them, however large they get.
+    expect(existsSync(journal)).toBe(true);
+  });
+
+  it("appends a group of rows all-or-nothing", () => {
+    const queueDir = makeQueueDir();
+    const rows = [makeRow("s-group", 0), makeRow("s-group", 1), makeRow("s-group", 2)];
+    const bytes = rows.reduce((n, r) => n + queuedRowBytes(r), 0);
+
+    // One byte short of what the group needs: nothing at all may be written.
+    const refused = appendQueuedSessionRows(rows, queueDir, bytes - 1);
+    expect(refused.appended).toBe(false);
+    expect(existsSync(refused.queuePath)).toBe(true);
+    expect(readFileSync(refused.queuePath, "utf-8")).toBe("");
+
+    // Exactly enough room: all three land together.
+    const accepted = appendQueuedSessionRows(rows, queueDir, bytes);
+    expect(accepted.appended).toBe(true);
+    expect(readFileSync(accepted.queuePath, "utf-8").split("\n").filter(Boolean)).toHaveLength(3);
+  });
+
+  it("defaults the ceiling to 256 MB", () => {
+    expect(MAX_SESSION_QUEUE_BYTES).toBe(256 * 1024 * 1024);
   });
 });

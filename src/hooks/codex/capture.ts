@@ -13,14 +13,19 @@
  */
 
 import { readStdin } from "../../utils/stdin.js";
-import { loadConfig, type Config } from "../../config.js";
+import { type Config } from "../../config.js";
+import { resolveCaptureConfig } from "../shared/dir-gate.js";
+import { redactSecrets } from "../shared/redact.js";
 import { DeeplakeApi } from "../../deeplake-api.js";
-import { sqlStr } from "../../utils/sql.js";
+import { projectNameFromCwd } from "../../utils/project-name.js";
 import { log as _log } from "../../utils/debug.js";
 import { buildSessionPath } from "../../utils/session-path.js";
+import { parseCodexTurnMeta } from "../../notifications/model-usage.js";
 import { EmbedClient } from "../../embeddings/client.js";
 import { embeddingSqlLiteral } from "../../embeddings/sql.js";
 import { embeddingsDisabled } from "../../embeddings/disable.js";
+import { buildDirectSessionInsertSql } from "../shared/session-insert-sql.js";
+import { ensurePluginNodeModulesLink } from "../../embeddings/self-heal.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
@@ -28,10 +33,13 @@ import {
   loadTriggerConfig,
   shouldTrigger,
   tryAcquireLock,
+  markSummaryAttempt,
   releaseLock,
 } from "../summary-state.js";
 import { bundleDirFromImportMeta, spawnCodexWikiWorker, wikiLog } from "./spawn-wiki-worker.js";
 import { getInstalledVersion } from "../../utils/version-check.js";
+import { isHivemindPluginEnabled } from "../../utils/plugin-state.js";
+import { reactSkillOpt } from "../shared/skillopt-hook.js";
 const log = (msg: string) => _log("codex-capture", msg);
 
 function resolveEmbedDaemonPath(): string {
@@ -40,6 +48,14 @@ function resolveEmbedDaemonPath(): string {
 
 const __bundleDir = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_VERSION = getInstalledVersion(__bundleDir, ".codex-plugin") ?? "";
+
+// Self-heal the shared-deps symlink for this plugin version. Marketplace
+// auto-upgrades drop new versioned cache dirs without the symlink that
+// `hivemind embeddings install` originally created; this restores it on
+// first capture after each upgrade.
+if (!embeddingsDisabled()) {
+  try { ensurePluginNodeModulesLink({ bundleDir: __bundleDir }); } catch { /* best-effort */ }
+}
 
 interface CodexHookInput {
   session_id: string;
@@ -61,14 +77,23 @@ const CAPTURE = process.env.HIVEMIND_CAPTURE !== "false";
 
 async function main(): Promise<void> {
   if (!CAPTURE) return;
+  if (!isHivemindPluginEnabled()) { log("plugin disabled, skipping capture"); return; }
   const input = await readStdin<CodexHookInput>();
-  const config = loadConfig();
-  if (!config) { log("no config"); return; }
+  const config = resolveCaptureConfig(input.cwd ?? process.cwd(), log);
+  if (!config) return;
 
   const sessionsTable = config.sessionsTableName;
   const api = new DeeplakeApi(config.token, config.apiUrl, config.orgId, config.workspaceId, sessionsTable);
 
   const ts = new Date().toISOString();
+  // Reasoning effort + token usage aren't in the hook payload — read them from
+  // the rollout transcript (turn_context + token_count). `token_usage` is the
+  // latest turn (scoped to the current model); `token_usage_total` is the
+  // whole-session cumulative across every model. Codex has no assistant event,
+  // so this rides on every user/tool row — `turn_id` (in meta) lets a per-model
+  // rollup dedupe the shared per-turn snapshot. Best-effort; falls back to the
+  // payload model.
+  const modelMeta = parseCodexTurnMeta(input.transcript_path, input.model);
   const meta = {
     session_id: input.session_id,
     transcript_path: input.transcript_path,
@@ -77,6 +102,7 @@ async function main(): Promise<void> {
     model: input.model,
     turn_id: input.turn_id,
     timestamp: ts,
+    ...(modelMeta ?? {}),
   };
 
   let entry: Record<string, unknown>;
@@ -106,10 +132,10 @@ async function main(): Promise<void> {
   }
 
   const sessionPath = buildSessionPath(config, input.session_id);
-  const line = JSON.stringify(entry);
+  const line = redactSecrets(JSON.stringify(entry));
   log(`writing to ${sessionPath}`);
 
-  const projectName = (input.cwd ?? "").split("/").pop() || "unknown";
+  const projectName = projectNameFromCwd(input.cwd);
   const filename = sessionPath.split("/").pop() ?? "";
   // For JSONB: only escape single quotes for the SQL literal, keep JSON structure intact.
   // sqlStr() would also escape backslashes and strip control chars, corrupting the JSON.
@@ -122,10 +148,22 @@ async function main(): Promise<void> {
     : await new EmbedClient({ daemonEntry: resolveEmbedDaemonPath() }).embed(line, "document");
   const embeddingSql = embeddingSqlLiteral(embedding);
 
-  const insertSql =
-    `INSERT INTO "${sessionsTable}" (id, path, filename, message, message_embedding, author, size_bytes, project, description, agent, plugin_version, creation_date, last_update_date) ` +
-    `VALUES ('${crypto.randomUUID()}', '${sqlStr(sessionPath)}', '${sqlStr(filename)}', '${jsonForSql}'::jsonb, ${embeddingSql}, '${sqlStr(config.userName)}', ` +
-    `${Buffer.byteLength(line, "utf-8")}, '${sqlStr(projectName)}', '${sqlStr(input.hook_event_name ?? "")}', 'codex', '${sqlStr(PLUGIN_VERSION)}', '${ts}', '${ts}')`;
+  const insertSql = buildDirectSessionInsertSql(sessionsTable, {
+    // Reuse the event id already embedded in the message JSON so the row PK
+    // matches the payload's id (and keeps the dedup key = the logical event).
+    id: entry.id as string,
+    sessionPath,
+    filename,
+    jsonForSql,
+    embeddingSql,
+    userName: config.userName,
+    sizeBytes: Buffer.byteLength(line, "utf-8"),
+    projectName,
+    description: input.hook_event_name ?? "",
+    agent: "codex",
+    pluginVersion: PLUGIN_VERSION,
+    timestamp: ts,
+  });
 
   try {
     await api.query(insertSql);
@@ -140,6 +178,10 @@ async function main(): Promise<void> {
   }
 
   log("capture ok");
+
+  // SkillOpt: a UserPromptSubmit prompt is the user's reaction to a recently-used org skill.
+  // Swallowed; no-op unless a judgment window is open for this session.
+  reactSkillOpt(input.session_id, input.prompt, "codex");
 
   maybeTriggerPeriodicSummary(input.session_id, input.cwd ?? "", config);
 }
@@ -159,6 +201,12 @@ function maybeTriggerPeriodicSummary(sessionId: string, cwd: string, config: Con
 
     wikiLog(`Periodic: threshold hit (total=${state.totalCount}, since=${state.totalCount - state.lastSummaryCount}, N=${cfg.everyNMessages}, hours=${cfg.everyHours})`);
     try {
+      // Stamp the attempt BEFORE spawning: a run that fails never reaches
+      // finalizeSummary, and without this the trigger would refire on the
+      // very next captured event (issue #331). Inside the try so a failed
+      // state write releases the lock instead of leaking it until the
+      // 10-minute stale reclaim.
+      markSummaryAttempt(sessionId);
       spawnCodexWikiWorker({
         config,
         sessionId,

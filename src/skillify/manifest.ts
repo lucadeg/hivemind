@@ -18,16 +18,25 @@
  */
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { migrateLegacyStateDir } from "./legacy-migration.js";
 import type { InstallLocation } from "./scope-config.js";
+import { getStateDir } from "./state-dir.js";
 
 export interface PulledEntry {
   /** Directory name on disk (e.g. "meta-harness-continual-learning--d"). */
   dirName: string;
   /** Skill name (without author suffix). */
   name: string;
+  /**
+   * Original (pre-cap) skills-table row name this install came from. Equals
+   * `name` unless the row name exceeded the loader's 64-char ceiling and was
+   * length-capped. Persisted so a later pull can tell whether an existing
+   * capped destination belongs to THIS row or a different one that happens to
+   * cap to the same identity (a lossy-hash collision) — and refuse to overwrite
+   * across invocations. Absent on legacy entries recorded before this field.
+   */
+  rawName?: string;
   /** Author who originally minted the skill. */
   author: string;
   /** Skills-table `project_key` of the source project. */
@@ -63,8 +72,14 @@ function emptyManifest(): PulledManifest {
   return { version: 1, entries: [] };
 }
 
+// Routed through `getStateDir()` so the pulled-skills manifest lives next
+// to the rest of skillify state (`HIVEMIND_STATE_DIR`-aware). Without
+// this, tests that called `recordPull` / `unlinkSymlinks` would still
+// write `pulled.json` into the developer's real `~/.deeplake` while the
+// lock and counter state landed in the tmp dir — inconsistent state
+// across the same directory tree.
 export function manifestPath(): string {
-  return join(homedir(), ".deeplake", "state", "skillify", "pulled.json");
+  return join(getStateDir(), "pulled.json");
 }
 
 export function loadManifest(path: string = manifestPath()): PulledManifest {
@@ -111,6 +126,9 @@ export function loadManifest(path: string = manifestPath()): PulledManifest {
       entries.push({
         dirName: e.dirName,
         name: e.name,
+        // Optional — preserved for cross-run cap-collision detection. Absent on
+        // legacy entries; only carry a valid string through.
+        ...(typeof e.rawName === "string" && e.rawName ? { rawName: e.rawName } : {}),
         author: e.author,
         projectKey: typeof e.projectKey === "string" ? e.projectKey : "",
         remoteVersion: typeof e.remoteVersion === "number" ? e.remoteVersion : 1,

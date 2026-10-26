@@ -38,9 +38,11 @@ import {
 import { extractPairs, type Pair } from "../skillify/extractors/index.js";
 import { findAgentBin, type Agent } from "../skillify/gate-runner.js";
 import { extractJsonBlock } from "../skillify/gate-parser.js";
+import { permissionFlags, type ClaudeGrants } from "../hooks/wiki-worker-spawn.js";
 import { resolveSkillsRoot, writeNewSkill, listSkills, parseFrontmatter } from "../skillify/skill-writer.js";
 import { detectAgentSkillsRoots } from "../skillify/agent-roots.js";
 import { fanOutSymlinks } from "../skillify/pull.js";
+import { runAdvisor } from "../skillify/advisor.js";
 import {
   LOCAL_MANIFEST_PATH,
   LOCAL_MINE_LOCK_PATH,
@@ -90,6 +92,12 @@ function runGateViaStdin(opts: {
   bin: string;
   prompt: string;
   timeoutMs: number;
+  /**
+   * Dirs/tools to grant explicitly instead of the blanket `bypassPermissions`,
+   * which an enterprise policy can disable. See ClaudeGrants in
+   * ../hooks/wiki-worker-spawn.ts.
+   */
+  grants?: ClaudeGrants;
 }): Promise<{ stdout: string; stderr: string; errored: boolean; errorMessage?: string }> {
   return new Promise((resolve) => {
     if (opts.agent !== "claude_code") {
@@ -115,11 +123,15 @@ function runGateViaStdin(opts: {
       "-p",
       "--no-session-persistence",
       "--model", "haiku",
-      "--permission-mode", "bypassPermissions",
+      ...permissionFlags(opts.grants),
     ];
     const child = spawn(opts.bin, args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, HIVEMIND_WIKI_WORKER: "1", HIVEMIND_CAPTURE: "false" },
+      // CREATE_NO_WINDOW: this runs inside the detached, console-less mine-local
+      // worker, so without it Windows pops a visible console window for the
+      // summarizer CLI child. No-op on POSIX.
+      windowsHide: true,
     });
 
     let stdout = "";
@@ -208,11 +220,26 @@ function buildSessionPrompt(pairs: Pair[], session: SessionFile, verdictPath: st
     `- A skill qualifies if it captures a concrete, repeatable workflow OR a non-obvious`,
     `  constraint/gotcha a future engineer would benefit from knowing. Intra-session is fine —`,
     `  one deep dive yielding a generalizable takeaway counts.`,
+    `- Especially valuable: REPEATABLE-MISTAKE patterns. Cases where the assistant declared`,
+    `  work "done"/"fixed"/"verified" and the user came back to the same problem later; where`,
+    `  the same class of mistake recurs (forgot to run tests, mishandled async state,`,
+    `  hallucinated function/file existence, re-asked for confirmation on already-authorized`,
+    `  work, jumped to plans without checking with the user, etc.); where the user manually`,
+    `  corrected the same kind of error >1 time. These are the highest-value catches.`,
     `- Skip patterns that are obvious from reading the codebase or already in CLAUDE.md.`,
     `- Each body uses short sections (When to use, Workflow, Anti-patterns), concrete commands`,
     `  / paths / snippets drawn from the exchanges below, no marketing, no emojis.`,
     `- Each body under ~3000 characters.`,
     `- Skill names are kebab-case slugs (lowercase letters/digits/hyphens only).`,
+    `- For each skill, also emit a one-line "insight": a concrete, quantified, second-person`,
+    `  sentence describing what hivemind found that prompted the skill. Examples:`,
+    `    "You revisited 4 merged PRs in the last month because the assistant declared 'done'`,
+    `     before checking test output."`,
+    `    "You corrected the same env-mismatch (beta vs prod) twice in the same week before`,
+    `     deciding to switch deployment targets."`,
+    `  The insight is what users will see at next SessionStart, so it must be honest — only`,
+    `  assert counts and patterns you can ground in THIS session's exchanges. Omit the field`,
+    `  if you cannot write a concrete, quantified line.`,
     ``,
     `=== EXCHANGES (user prompts + assistant final answers, tool calls stripped) ===`,
     renderPairsBlock(pairs),
@@ -229,9 +256,10 @@ function buildSessionPrompt(pairs: Pair[], session: SessionFile, verdictPath: st
     `  "skills": [`,
     `    {`,
     `      "name": "<kebab-case>",`,
-    `      "description": "<one-line>",`,
-    `      "trigger": "<short trigger>",`,
-    `      "body": "<full SKILL.md body without frontmatter>"`,
+    `      "description": "<one-line: what the skill does>",`,
+    `      "trigger": "<REQUIRED: one concrete activation condition, phrased 'Use this skill when <situation>' — folded into the host-visible description, so make it specific>",`,
+    `      "body": "<full SKILL.md body without frontmatter>",`,
+    `      "insight": "<one-line, concrete + quantified + second person; OPTIONAL>"`,
     `    },`,
     `    ... up to 3 entries, or [] if nothing qualifies`,
     `  ]`,
@@ -246,6 +274,13 @@ export interface MinedSkill {
   description: string;
   trigger?: string;
   body: string;
+  /**
+   * One-line user-facing sentence describing what the gate found in the
+   * source session. Surfaced by the SessionStart banner when this skill is
+   * the most-recent insight-bearing entry. Optional — the gate omits it
+   * when it cannot ground a concrete + quantified line.
+   */
+  insight?: string;
 }
 
 export interface MultiVerdict {
@@ -275,8 +310,22 @@ export function parseMultiVerdict(raw: string): MultiVerdict | null {
     const description = typeof s.description === "string" ? s.description.trim() : "";
     const body = typeof s.body === "string" ? s.body.trim() : "";
     const trigger = typeof s.trigger === "string" ? s.trigger.trim() : undefined;
+    // Insight is optional and is unbounded model output — apply
+    // sanitization at this parse boundary so the manifest can be trusted
+    // by every downstream consumer (banner renderer, future surfaces,
+    // hook payload size budgets). Collapse all whitespace to a single
+    // space (drops embedded newlines that could carry prompt-like
+    // instructions into future SessionStart context) and cap length so
+    // a pathological gate output can't bloat the hook payload. Empty /
+    // whitespace-only strings collapse to undefined so the manifest
+    // entry stays free of an empty-string sentinel.
+    const rawInsight = typeof s.insight === "string" ? s.insight : "";
+    const normalizedInsight = rawInsight.replace(/\s+/g, " ").trim();
+    const insight = normalizedInsight.length > 0
+      ? normalizedInsight.slice(0, 280)
+      : undefined;
     if (!name || !body) continue;
-    out.push({ name, description, body, trigger });
+    out.push({ name, description, body, trigger, insight });
   }
   return { reason: typeof parsed.reason === "string" ? parsed.reason : undefined, skills: out };
 }
@@ -441,6 +490,14 @@ async function runMineLocalImpl(args: string[]): Promise<void> {
   const force = takeBoolFlag(work, "--force");
   const dryRun = takeBoolFlag(work, "--dry-run");
   const nRaw = takeFlagValue(work, "--n");
+  const onlyAgent = takeFlagValue(work, "--only");
+  // --advise: after writing the manifest, run the sonnet advisor to rank the
+  // insight-bearing candidates and mark the strongest as primary, so
+  // getLatestInsightEntry (and the SessionStart banner) surface the best
+  // finding rather than the most-recent one. Off by default so the plain
+  // SessionStart auto-mine stays haiku-only; the install-time background scan
+  // opts in.
+  const advise = takeBoolFlag(work, "--advise");
 
   if (loadManifest() && !force) {
     console.error(`Local skills have already been mined on this machine.`);
@@ -449,12 +506,25 @@ async function runMineLocalImpl(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const installs = detectInstalledAgents();
-  if (installs.length === 0) {
+  const installsAll = detectInstalledAgents();
+  if (installsAll.length === 0) {
     console.error(`No agent session directories detected. Run a session first.`);
     process.exit(1);
   }
-  console.log(`Detected installed agents: ${installs.map(i => i.agent).join(", ")}`);
+  // Optional agent filter: scope mining to a single agent's sessions
+  // (e.g. `--only claude_code`). Used by the install-time scan to
+  // honor a "scan your Claude Code sessions" promise — without this
+  // filter, the picker walks every installed agent's sessions and
+  // could surface an insight from Codex / Cursor / etc when only
+  // Claude Code was advertised (codex PR #198 P2 finding).
+  const installs = onlyAgent
+    ? installsAll.filter(i => i.agent === onlyAgent)
+    : installsAll;
+  if (installs.length === 0) {
+    console.error(`No '${onlyAgent}' session directory detected. Skipping mine-local.`);
+    process.exit(1);
+  }
+  console.log(`Detected installed agents: ${installs.map(i => i.agent).join(", ")}${onlyAgent ? ` (filtered to ${onlyAgent})` : ""}`);
 
   const host = detectHostAgent();
   const fallback = installs[0].agent;
@@ -523,7 +593,16 @@ async function runMineLocalImpl(args: string[]): Promise<void> {
     const prompt = buildSessionPrompt(tail, s, verdictPath);
     writeFileSync(join(sessionTmp, "prompt.txt"), prompt);
 
-    const gate = await runGateViaStdin({ agent: gateAgent, bin: gateBin, prompt, timeoutMs: GATE_TIMEOUT_MS });
+    // sessionTmp holds the verdict path named in the prompt and lives outside
+    // the session cwd, so grant it explicitly rather than relying on the
+    // bypass an enterprise policy can disable.
+    const gate = await runGateViaStdin({
+      agent: gateAgent,
+      bin: gateBin,
+      prompt,
+      timeoutMs: GATE_TIMEOUT_MS,
+      grants: { addDirs: [sessionTmp], allowedTools: ["Read", "Write"] },
+    });
     try {
       writeFileSync(join(sessionTmp, "gate-stdout.txt"), gate.stdout);
       if (gate.stderr) writeFileSync(join(sessionTmp, "gate-stderr.txt"), gate.stderr);
@@ -597,7 +676,7 @@ async function runMineLocalImpl(args: string[]): Promise<void> {
     console.log(`Fan-out targets: ${fanOutRoots.join(", ")}`);
   }
 
-  const written: Array<{ skill: MinedSkill; session: SessionFile; result: { path: string; createdAt: string }; symlinks: string[] }> = [];
+  const written: Array<{ skill: MinedSkill; session: SessionFile; result: { path: string; name: string; createdAt: string }; symlinks: string[] }> = [];
   const knownSummaries: Array<{ name: string; desc: string }> = [...existingSummaries];
 
   for (const { skill, session } of flat) {
@@ -607,6 +686,10 @@ async function runMineLocalImpl(args: string[]): Promise<void> {
       continue;
     }
     try {
+      // writeNewSkill validates the raw name then length-caps it to the
+      // 64-char loader ceiling (an over-long mined name is truncated, not
+      // dropped) and returns the canonical on-disk name. Use result.name for
+      // the log line and dedup list so they match what's written.
       const result = writeNewSkill({
         skillsRoot,
         name: skill.name,
@@ -621,9 +704,9 @@ async function runMineLocalImpl(args: string[]): Promise<void> {
         ? fanOutSymlinks(canonicalDir, basename(canonicalDir), fanOutRoots)
         : [];
       const symlinkSuffix = symlinks.length > 0 ? `, fan-out → ${symlinks.length} root(s)` : "";
-      console.log(`  wrote ${skill.name} ← session ${session.sessionId.slice(0, 8)} (${session.agent}${symlinkSuffix})`);
+      console.log(`  wrote ${result.name} ← session ${session.sessionId.slice(0, 8)} (${session.agent}${symlinkSuffix})`);
       written.push({ skill, session, result, symlinks });
-      knownSummaries.push({ name: skill.name, desc: skill.description });
+      knownSummaries.push({ name: result.name, desc: skill.description });
     } catch (e: any) {
       if (/already exists/i.test(e.message ?? "")) {
         console.log(`  skipped ${skill.name} (file already exists at ${skillsRoot})`);
@@ -640,7 +723,10 @@ async function runMineLocalImpl(args: string[]): Promise<void> {
   if (written.length > 0) {
     const existing = loadManifest();
     const newEntries: ManifestEntry[] = written.map(({ skill, session, result, symlinks }) => ({
-      skill_name: skill.name,
+      // result.name is the canonical (possibly length-capped) on-disk name, so
+      // the manifest identity matches canonical_path / the frontmatter — not
+      // the raw model name, which may not exist on disk.
+      skill_name: result.name,
       canonical_path: result.path,
       symlinks,
       source_session_ids: [session.sessionId],
@@ -649,11 +735,24 @@ async function runMineLocalImpl(args: string[]): Promise<void> {
       gate_agent: gateAgent,
       created_at: result.createdAt,
       uploaded: false,
+      // Persist the one-line insight when the gate produced one. Omitted
+      // (undefined → absent in JSON) when the gate couldn't ground a
+      // concrete line, so the SessionStart banner falls back to the
+      // count-only surface for entries written before this field landed.
+      ...(skill.insight ? { insight: skill.insight } : {}),
     }));
     saveManifest({
       created_at: existing?.created_at ?? new Date().toISOString(),
       entries: [...(existing?.entries ?? []), ...newEntries],
     });
+
+    // Rank the freshly-written insight candidates with the sonnet advisor
+    // and mark the best as primary. Best-effort: on any failure we keep the
+    // recency-ordered pick. Only worth a sonnet call when >1 candidate
+    // carries an insight — runAdvisor itself fast-paths the trivial case.
+    if (advise) {
+      try { await runAdvisor(); } catch { /* keep recency pick */ }
+    }
   }
 
   console.log("");

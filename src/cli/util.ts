@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, cpSync, symlinkSync, unlinkSync, lstatSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, cpSync, rmSync, symlinkSync, unlinkSync, lstatSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline";
 
 export const HOME = homedir();
 
@@ -13,7 +14,7 @@ export const HOME = homedir();
 //                                               → install dir
 // Without the walk-up, the source path resolved to `src/` (one dir up
 // from src/cli/util.ts), so unit tests importing the installers couldn't
-// find the per-agent bundles at project_root/<agent>/bundle/.
+// find the per-agent bundles at project_root/harnesses/<agent>/bundle/.
 export function pkgRoot(): string {
   let dir = fileURLToPath(new URL(".", import.meta.url));
   for (let i = 0; i < 8; i++) {
@@ -38,6 +39,85 @@ export function copyDir(src: string, dst: string): void {
   cpSync(src, dst, { recursive: true, force: true, dereference: false });
 }
 
+/**
+ * Remove every entry of `dir` whose name is not in `keep`. Returns the
+ * removed paths. Only for directories hivemind owns outright (a bundle dir,
+ * a skill dir the installer itself created): symlinks are unlinked, never
+ * followed, and a `dir` that is itself a symlink is left alone.
+ */
+export function pruneDir(dir: string, keep: Iterable<string>): string[] {
+  if (isLink(dir) || !existsSync(dir)) return [];
+  const wanted = new Set(keep);
+  const removed: string[] = [];
+  for (const name of readdirSync(dir)) {
+    if (wanted.has(name)) continue;
+    const path = join(dir, name);
+    rmSync(path, { recursive: true, force: true });
+    removed.push(path);
+  }
+  return removed;
+}
+
+/**
+ * Make `dst` mirror `src`: copy everything over, then remove whatever the
+ * previous install left under `dst` that `src` no longer ships (renamed
+ * hashed chunks, dropped skills, deleted workers). Recurses into real
+ * subdirectories present on both sides. `dst` must be a directory hivemind
+ * owns — see pruneDir. Returns the removed paths.
+ */
+export function syncDir(src: string, dst: string): string[] {
+  if (isLink(dst)) {
+    warn(`  skipping ${dst}: it is a symlink, not a hivemind-owned directory`);
+    return [];
+  }
+  const removed = dropUnreplaceable(src, dst);
+  copyDir(src, dst);
+  removed.push(...pruneToSource(src, dst));
+  return removed;
+}
+
+// Clear what cpSync cannot replace in place: an entry whose kind changed
+// between versions (file <-> directory), and a symlink at a shipped name,
+// which cpSync would otherwise write through into whatever it points at.
+function dropUnreplaceable(src: string, dst: string): string[] {
+  if (!existsSync(dst) || isLink(dst)) return [];
+  const removed: string[] = [];
+  for (const entry of readdirSync(src, { withFileTypes: true })) {
+    const target = join(dst, entry.name);
+    let st;
+    try { st = lstatSync(target); } catch { continue; }
+    if (st.isSymbolicLink()) {
+      unlinkSync(target);
+      removed.push(target);
+      continue;
+    }
+    if (st.isDirectory() === entry.isDirectory()) {
+      if (entry.isDirectory()) removed.push(...dropUnreplaceable(join(src, entry.name), target));
+      continue;
+    }
+    rmSync(target, { recursive: true, force: true });
+    removed.push(target);
+  }
+  return removed;
+}
+
+function pruneToSource(src: string, dst: string): string[] {
+  const shipped = readdirSync(src, { withFileTypes: true });
+  const removed = pruneDir(dst, shipped.map(e => e.name));
+  for (const entry of shipped) {
+    if (!entry.isDirectory()) continue;
+    const sub = join(dst, entry.name);
+    if (isLink(sub) || !lstatSync(sub).isDirectory()) continue;
+    removed.push(...pruneToSource(join(src, entry.name), sub));
+  }
+  return removed;
+}
+
+/** One log line per path syncDir/pruneDir removed, in the installer's column layout. */
+export function reportPruned(label: string, removed: string[]): void {
+  for (const path of removed) log(`  ${label.padEnd(15)}removed stale ${path}`);
+}
+
 export function symlinkForce(target: string, link: string): void {
   ensureDir(dirname(link));
   if (existsSync(link) || isLink(link)) unlinkSync(link);
@@ -58,6 +138,29 @@ export function writeJson(path: string, obj: unknown): void {
   writeFileSync(path, JSON.stringify(obj, null, 2) + "\n");
 }
 
+/**
+ * Write JSON only if the serialized result differs from what's already on
+ * disk. Returns true if it wrote, false if the file already matched.
+ *
+ * Why: Codex fingerprints each hook *definition* and re-prompts the user to
+ * "review & trust" whenever a hook it sees has changed. Our installer used to
+ * rewrite hooks.json unconditionally on every install/update — even when the
+ * merged result was byte-identical — which re-triggered that trust prompt for
+ * no reason. Skipping the write when nothing changed keeps the file (and its
+ * fingerprint) stable, so Codex stops re-asking after the first trust.
+ */
+export function writeJsonIfChanged(path: string, obj: unknown): boolean {
+  const next = JSON.stringify(obj, null, 2) + "\n";
+  if (existsSync(path)) {
+    try {
+      if (readFileSync(path, "utf-8") === next) return false; // unchanged → no write
+    } catch { /* unreadable → fall through and rewrite */ }
+  }
+  ensureDir(dirname(path));
+  writeFileSync(path, next);
+  return true;
+}
+
 export function writeVersionStamp(dir: string, version: string): void {
   ensureDir(dir);
   writeFileSync(join(dir, ".hivemind_version"), version);
@@ -69,11 +172,21 @@ export function readVersionStamp(dir: string): string | null {
   try { return readFileSync(p, "utf-8").trim(); } catch { return null; }
 }
 
-export type PlatformId = "claude" | "codex" | "claw" | "cursor" | "hermes" | "pi";
+export type PlatformId = "claude" | "codex" | "claw" | "cursor" | "hermes" | "pi" | "claude_cowork";
 
 export interface DetectedPlatform {
   id: PlatformId;
   markerDir: string;
+}
+
+// Claude Desktop — host app for Claude Cowork — stores its connector config
+// in an OS-specific application-support dir, NOT in ~/.claude (that's the
+// Claude Code CLI). Cowork reads MCP servers from claude_desktop_config.json
+// inside this dir, shared with Claude Desktop chat.
+export function claudeDesktopConfigDir(): string {
+  if (process.platform === "darwin") return join(HOME, "Library", "Application Support", "Claude");
+  if (process.platform === "win32") return join(process.env.APPDATA ?? join(HOME, "AppData", "Roaming"), "Claude");
+  return join(HOME, ".config", "Claude");
 }
 
 // Hivemind's value is bidirectional shared memory — every supported agent
@@ -93,6 +206,11 @@ const PLATFORM_MARKERS: DetectedPlatform[] = [
   // a rich extension event API (session_start / input / tool_call /
   // tool_result / message_end / session_shutdown / etc.) — Tier 1 capable.
   { id: "pi", markerDir: join(HOME, ".pi") },
+  // claude_cowork — Anthropic's agentic desktop assistant, hosted in the
+  // Claude Desktop app. Registers the shared hivemind MCP server into
+  // claude_desktop_config.json (recall-only; capture is the desktop app's
+  // own concern). Marker is the OS-specific Claude Desktop config dir.
+  { id: "claude_cowork", markerDir: claudeDesktopConfigDir() },
 ];
 
 export function detectPlatforms(): DetectedPlatform[] {
@@ -109,4 +227,34 @@ export function log(msg: string): void {
 
 export function warn(msg: string): void {
   process.stderr.write(msg + "\n");
+}
+
+// Interactive y/n prompt. Renders the hint based on the default so a bare
+// Enter is unambiguous. Writes the question to stderr (same channel as warn)
+// so log piping stays clean. Callers must check process.stdin.isTTY first —
+// readline on closed stdin would hang the process.
+export function confirm(message: string, defaultYes = true): Promise<boolean> {
+  const hint = defaultYes ? "[Y/n]" : "[y/N]";
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  return new Promise(resolve => {
+    rl.question(`${message} ${hint} `, answer => {
+      rl.close();
+      const a = answer.trim().toLowerCase();
+      if (a === "") resolve(defaultYes);
+      else resolve(a === "y" || a === "yes");
+    });
+  });
+}
+
+// Free-text prompt. Returns the trimmed answer, or "" if the user just
+// pressed Enter. Same TTY caveat as confirm() — readline hangs on closed
+// stdin, so callers must gate on process.stdin.isTTY.
+export function promptLine(message: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  return new Promise(resolve => {
+    rl.question(message, answer => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
 }

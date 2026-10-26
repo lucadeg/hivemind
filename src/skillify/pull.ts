@@ -18,15 +18,16 @@
  */
 
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, renameSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync,
   lstatSync, readlinkSync, symlinkSync, unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { assertValidSkillName, parseFrontmatter, type SkillFrontmatter } from "./skill-writer.js";
+import { assertValidSkillName, capSkillName, composeDescription, parseFrontmatter, type SkillFrontmatter } from "./skill-writer.js";
 import type { InstallLocation } from "./scope-config.js";
-import { entriesForRoot, loadManifest, pruneOrphanedEntries, recordPull } from "./manifest.js";
+import { entriesForRoot, loadManifest, pruneOrphanedEntries, recordPull, removePullEntry, unlinkSymlinks, type PulledEntry } from "./manifest.js";
 import { detectAgentSkillsRoots } from "./agent-roots.js";
+import { isOwnSkill, parseContributorList } from "./ownership.js";
 
 /**
  * Tighter-than-skill-name validator for the author segment that becomes a
@@ -59,6 +60,27 @@ export interface PullOptions {
   dryRun?: boolean;
   /** Overwrite even when local version >= remote. Backs up the existing file. */
   force?: boolean;
+  /**
+   * Optional existence predicate built from a trusted table list (see
+   * DeeplakeApi.knownTablesOrNull). When it reports the skills table absent
+   * we skip the SELECT and treat it as empty — a fresh workspace lazily
+   * creates `skills` on first INSERT, so reading it first otherwise logs a
+   * 42P01 server-side on every SessionStart auto-pull. Omitted (or the list
+   * couldn't be fetched) falls back to the SELECT-then-catch path below.
+   */
+  tableExists?: (name: string) => boolean;
+  /**
+   * The current user. Their own rows (author, or listed contributor) install
+   * into the plain `<name>` slot (where their locally-mined copy lives), not
+   * `<name>--<author>`, so one skill has one dir and the gate continues its
+   * version chain.
+   */
+  selfAuthor?: string;
+  /**
+   * For global pulls: the project whose `.claude/skills/<name>` also counts
+   * as the user's own copy. An own row at or below that version is skipped.
+   */
+  projectCwd?: string;
 }
 
 export interface PullResultEntry {
@@ -299,13 +321,14 @@ function sameSorted(a: readonly string[], b: readonly string[]): boolean {
 
 /**
  * From the rows returned by the SELECT, keep only the highest-version
- * row per (project_key, name). The SQL already orders by
+ * row per (project_key, name, author). The SQL already orders by
  * (project_key ASC, name ASC, version DESC), so the first row seen for a
  * given composite key is the latest version.
  *
  * Important: keying by name alone would silently drop one of two distinct
  * skills that happen to share a name across projects (e.g. two repos both
- * have a `deploy` skill).
+ * have a `deploy` skill), and keying without the author would drop a
+ * second author's chain under the same name.
  */
 export function selectLatestPerName(rows: Record<string, unknown>[]): Record<string, unknown>[] {
   const seen = new Set<string>();
@@ -313,11 +336,56 @@ export function selectLatestPerName(rows: Record<string, unknown>[]): Record<str
   for (const r of rows) {
     const name = String(r.name ?? "");
     const projectKey = String(r.project_key ?? "");
+    const author = String(r.author ?? "");
     if (!name) continue;
-    const key = `${projectKey}\x00${name}`;
+    const key = `${projectKey}\x00${name}\x00${author}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(r);
+  }
+  return out;
+}
+
+function rowTime(row: Record<string, unknown>): number | null {
+  const t = Date.parse(String(row.created_at ?? ""));
+  return Number.isFinite(t) ? t : null;
+}
+
+/** True when `a` was created after `b`. Falls back to string order for odd timestamps. */
+function createdAfter(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const ta = rowTime(a);
+  const tb = rowTime(b);
+  if (ta !== null && tb !== null) return ta > tb;
+  return String(a.created_at ?? "") > String(b.created_at ?? "");
+}
+
+/**
+ * A chain (name, author A) is retired when a newer row of the same name by
+ * another author lists A as a contributor: `skillify dedupe` merged A's
+ * skill into that chain. Returns the surviving author per retired row.
+ */
+export function retiredChains(latest: Record<string, unknown>[]): Map<Record<string, unknown>, string> {
+  const byName = new Map<string, Record<string, unknown>[]>();
+  for (const r of latest) {
+    const name = String(r.name ?? "");
+    const list = byName.get(name) ?? [];
+    list.push(r);
+    byName.set(name, list);
+  }
+  const out = new Map<Record<string, unknown>, string>();
+  for (const rows of byName.values()) {
+    if (rows.length < 2) continue;
+    for (const r of rows) {
+      const author = String(r.author ?? "");
+      if (!author) continue;
+      const survivor = rows.find(o =>
+        o !== r &&
+        String(o.author ?? "") !== author &&
+        parseContributorList(o.contributors).includes(author) &&
+        createdAfter(o, r),
+      );
+      if (survivor) out.set(r, String(survivor.author));
+    }
   }
   return out;
 }
@@ -326,7 +394,7 @@ export function selectLatestPerName(rows: Record<string, unknown>[]): Record<str
  * Render a SKILL.md from a skills-table row. Mirrors writer's frontmatter
  * shape so the pulled file is indistinguishable from a locally-generated one.
  */
-export function renderSkillFile(row: Record<string, unknown>): string {
+export function renderSkillFile(row: Record<string, unknown>, nameOverride?: string): string {
   const sources = parseSourceSessions(row.source_sessions);
   // Author + contributors land on disk so the gate sees the same lineage
   // info it would for a locally-mined skill. Without this, the worker on
@@ -344,7 +412,7 @@ export function renderSkillFile(row: Record<string, unknown>): string {
     ? contributors
     : (author ? [author] : []);
   const fm: SkillFrontmatter = {
-    name: String(row.name ?? ""),
+    name: nameOverride ?? String(row.name ?? ""),
     description: String(row.description ?? ""),
     trigger: typeof row.trigger_text === "string" && row.trigger_text.length > 0 ? String(row.trigger_text) : undefined,
     author,
@@ -372,20 +440,16 @@ function parseSourceSessions(v: unknown): string[] {
 
 /** Same shape as parseSourceSessions but for the `contributors` column. */
 function parseContributors(v: unknown): string[] {
-  if (Array.isArray(v)) return v.map(String);
-  if (typeof v === "string") {
-    try {
-      const parsed = JSON.parse(v);
-      if (Array.isArray(parsed)) return parsed.map(String);
-    } catch { /* not JSON, fall through */ }
-  }
-  return [];
+  return parseContributorList(v);
 }
 
 function renderFrontmatter(fm: SkillFrontmatter): string {
   const lines: string[] = ["---"];
   lines.push(`name: ${fm.name}`);
-  lines.push(`description: ${JSON.stringify(fm.description)}`);
+  // Fold the trigger into the host-visible description (see composeDescription).
+  // Because pull re-renders from table columns on every sync, this also
+  // retroactively fixes skills mined before the trigger lived in `description`.
+  lines.push(`description: ${JSON.stringify(composeDescription(fm.description, fm.trigger))}`);
   if (fm.trigger) lines.push(`trigger: ${JSON.stringify(fm.trigger)}`);
   if (fm.author) lines.push(`author: ${fm.author}`);
   lines.push(`source_sessions:`);
@@ -400,6 +464,18 @@ function renderFrontmatter(fm: SkillFrontmatter): string {
   lines.push(`updated_at: ${fm.updated_at}`);
   lines.push("---");
   return lines.join("\n");
+}
+
+/** Read the frontmatter `author` of an existing local SKILL.md, or null. */
+export function readLocalAuthor(path: string): string | null {
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = parseFrontmatter(readFileSync(path, "utf-8"));
+    const a = parsed?.fm.author;
+    return typeof a === "string" && a.length > 0 ? a : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Read the version field of an existing local SKILL.md, or null if missing/unparseable. */
@@ -435,6 +511,68 @@ export function decideAction(args: {
 }
 
 /**
+ * Move the user's own skill from a pull-managed legacy `<name>--<me>` dir
+ * into the `<name>` slot, when that slot is free. Content and version are
+ * kept, so the normal version check runs on the moved copy. When the slot
+ * is already taken, the legacy dir stays for `skillify dedupe`.
+ */
+/**
+ * A chain that `skillify dedupe` merged into another author's skill is no
+ * longer installed; a pull-managed copy of it left on disk would still load
+ * beside the merged skill. Retire the copy to SKILL.md.bak.
+ */
+function removeRetiredCopy(install: InstallLocation, root: string, rawName: string, author: string): void {
+  const dirNames = [`${capSkillName(rawName)}--${author}`, `${rawName}--${author}`];
+  const entries = entriesForRoot(loadManifest(), install, root);
+  const stale = entries.find(e => e.author === author && dirNames.includes(e.dirName));
+  if (!stale) return;
+  retireManagedCopy(install, root, stale);
+}
+
+/**
+ * Take a pull-managed copy out of the agents' view without deleting the
+ * user's files: its SKILL.md becomes SKILL.md.bak (a folder without SKILL.md
+ * is not a skill), its symlinks and manifest entry go. The .bak is safe to
+ * delete later.
+ */
+function retireManagedCopy(install: InstallLocation, root: string, copy: PulledEntry): void {
+  try {
+    const file = join(root, copy.dirName, "SKILL.md");
+    if (existsSync(file)) renameSync(file, `${file}.bak`);
+    unlinkSymlinks(copy.symlinks);
+    removePullEntry(install, root, copy.dirName);
+  } catch {
+    // Best effort: the copy stays until the next pull or dedupe.
+  }
+}
+
+/**
+ * An own row installs into the `<name>` slot. A pull-managed `<name>--<author>`
+ * copy of the same chain from an older pull must not stay beside it: with a
+ * free slot it becomes the slot; with an occupied slot (the row is written
+ * there below) the copy is retired to SKILL.md.bak, so the agent loads one skill.
+ */
+function adoptOwnLegacyDir(install: InstallLocation, root: string, name: string, legacyDirs: string[]): void {
+  const slot = join(root, name);
+  const entries = entriesForRoot(loadManifest(), install, root);
+  const legacy = entries.find(e => legacyDirs.includes(e.dirName) && existsSync(join(root, e.dirName)));
+  if (!legacy) return;
+  if (existsSync(slot)) {
+    retireManagedCopy(install, root, legacy);
+    return;
+  }
+  try {
+    renameSync(join(root, legacy.dirName), slot);
+    unlinkSymlinks(legacy.symlinks);
+    removePullEntry(install, root, legacy.dirName);
+    const symlinks = install === "global" ? fanOutSymlinks(slot, name, detectAgentSkillsRoots(root)) : [];
+    recordPull({ ...legacy, dirName: name, name, symlinks });
+  } catch {
+    // Best effort: the legacy copy stays usable where it is.
+  }
+}
+
+/**
  * Main entry point. Queries the skills table, applies filters, decides
  * actions, and (unless dry-run) writes SKILL.md files to the destination.
  *
@@ -463,44 +601,61 @@ export async function runPull(opts: PullOptions): Promise<PullSummary> {
   // hasn't been lazy-migrated by an INSERT yet) retry once with the
   // legacy SELECT shape so the pull keeps working until the next write.
   let rows: Record<string, unknown>[] = [];
-  try {
-    rows = await opts.query(sql);
-  } catch (e: any) {
-    if (isMissingTableError(e?.message)) {
-      rows = [];
-    } else if (isMissingContributorsColumnError(e?.message)) {
-      const legacySql = buildPullSql({
-        tableName: opts.tableName,
-        users: opts.users,
-        skillName: opts.skillName,
-        includeContributors: false,
-      });
-      rows = await opts.query(legacySql);
-    } else {
-      throw e;
+  if (opts.tableExists && !opts.tableExists(opts.tableName)) {
+    // Known-absent from a trusted table list: skip the SELECT so a fresh
+    // workspace doesn't log a 42P01 server-side. Leaves rows empty, the same
+    // outcome as the isMissingTableError catch below, minus the round-trip
+    // and the error.
+    rows = [];
+  } else {
+    try {
+      rows = await opts.query(sql);
+    } catch (e: any) {
+      if (isMissingTableError(e?.message)) {
+        rows = [];
+      } else if (isMissingContributorsColumnError(e?.message)) {
+        const legacySql = buildPullSql({
+          tableName: opts.tableName,
+          users: opts.users,
+          skillName: opts.skillName,
+          includeContributors: false,
+        });
+        rows = await opts.query(legacySql);
+      } else {
+        throw e;
+      }
     }
   }
   const latest = selectLatestPerName(rows);
+  const retired = retiredChains(latest);
 
   const root = resolvePullDestination(opts.install, opts.cwd);
   const summary: PullSummary = { scanned: latest.length, wrote: 0, skipped: 0, dryrun: 0, entries: [] };
 
+  // Maps a resolved `<cappedName>--<author>` destination to the raw row name
+  // that claimed it first. Capping is a lossy hash, so two distinct over-long
+  // names could resolve to the same destination; the first wins and later
+  // colliders are skipped (their rows stay in Deeplake, re-pullable) rather
+  // than silently overwriting each other on disk.
+  const claimedDirs = new Map<string, string>();
+
   for (const row of latest) {
-    const name = String(row.name ?? "");
-    if (!name) continue;
-    // Validate name BEFORE constructing any path — protects against a
-    // malicious or malformed `skills` row escaping the install root.
-    try { assertValidSkillName(name); }
-    catch (e: any) {
+    const rawName = String(row.name ?? "");
+    if (!rawName) continue;
+    const author = String(row.author ?? "");
+    // The chain was merged into another author's skill by `skillify dedupe`;
+    // that survivor row installs instead.
+    const mergedInto = retired.get(row);
+    if (mergedInto) {
+      if (!opts.dryRun) removeRetiredCopy(opts.install, root, rawName, author);
       summary.entries.push({
-        name, remoteVersion: Number(row.version ?? 1), localVersion: null,
-        action: "skipped", destination: "(invalid name — skipped)",
-        author: String(row.author ?? ""), sourceAgent: String(row.source_agent ?? ""),
+        name: rawName, remoteVersion: Number(row.version ?? 1), localVersion: null,
+        action: "skipped", destination: `(merged into ${mergedInto})`,
+        author, sourceAgent: String(row.source_agent ?? ""),
       });
       summary.skipped++;
       continue;
     }
-    const author = String(row.author ?? "");
     // Pulled skills land at `<root>/<name>--<author>/SKILL.md` so:
     //   1. Claude Code's skill loader (single-depth scan) sees them directly
     //   2. Cross-author name collisions stay disjoint on disk
@@ -520,74 +675,243 @@ export async function runPull(opts: PullOptions): Promise<PullSummary> {
     // ignoring an empty one is safer than guessing a placeholder.
     if (!author) {
       summary.entries.push({
-        name, remoteVersion: Number(row.version ?? 1), localVersion: null,
+        name: rawName, remoteVersion: Number(row.version ?? 1), localVersion: null,
         action: "skipped", destination: "(empty author — skipped)",
         author: "", sourceAgent: String(row.source_agent ?? ""),
       });
       summary.skipped++;
       continue;
     }
-    let dirName: string;
-    try {
-      assertValidAuthor(author);
-      dirName = `${name}--${author}`;
-    } catch (e: any) {
+    // Author is part of the directory name, so validate it before it feeds
+    // either the `--author` suffix or the name-cap budget below.
+    try { assertValidAuthor(author); }
+    catch (e: any) {
       summary.entries.push({
-        name, remoteVersion: Number(row.version ?? 1), localVersion: null,
+        name: rawName, remoteVersion: Number(row.version ?? 1), localVersion: null,
         action: "skipped", destination: `(invalid author '${author}' — skipped)`,
         author, sourceAgent: String(row.source_agent ?? ""),
       });
       summary.skipped++;
       continue;
     }
+    // Validate the RAW name's characters/path BEFORE truncating its length.
+    // A malicious row could pass a >64 name whose first 64 chars form a valid
+    // slug but whose tail carries traversal syntax or invalid chars; capping
+    // first would silently drop that tail and admit the row. assertValidSkillName
+    // is a path-safety validator with a generous 100-char ceiling, so a legacy
+    // 65–100 char name still passes here and is length-capped just below.
+    try { assertValidSkillName(rawName); }
+    catch (e: any) {
+      summary.entries.push({
+        name: rawName, remoteVersion: Number(row.version ?? 1), localVersion: null,
+        action: "skipped", destination: "(invalid name — skipped)",
+        author, sourceAgent: String(row.source_agent ?? ""),
+      });
+      summary.skipped++;
+      continue;
+    }
+    // Cap the (now char-validated) name to the skill-loader's 64-char frontmatter
+    // ceiling. Older rows were minted before generation-time capping and can
+    // exceed it; codex silently drops those on load, so truncating here lets them
+    // install cleanly. The capped name drives BOTH the frontmatter `name` and the
+    // `<name>--<author>` directory base so the two stay consistent.
+    const name = capSkillName(rawName);
+    const own = isOwnSkill(opts.selfAuthor, author, parseContributors(row.contributors));
+    const dirName = own ? name : `${name}--${author}`;
+
+    if (own) {
+      const projectFile = opts.install === "global" && opts.projectCwd
+        ? join(resolvePullDestination("project", opts.projectCwd), name, "SKILL.md")
+        : null;
+      const projectVersion = projectFile ? readLocalVersion(projectFile) : null;
+      // Versions compare only within one chain: a project copy by another
+      // author is not a reason to skip this row.
+      const sameChain = !projectFile || (readLocalAuthor(projectFile) ?? author) === author;
+      if (projectFile && sameChain && projectVersion !== null && projectVersion >= Number(row.version ?? 1)) {
+        summary.entries.push({
+          name, remoteVersion: Number(row.version ?? 1), localVersion: projectVersion,
+          action: "skipped", destination: projectFile,
+          author, sourceAgent: String(row.source_agent ?? ""),
+        });
+        summary.skipped++;
+        continue;
+      }
+      if (!opts.dryRun) adoptOwnLegacyDir(opts.install, root, name, [`${name}--${author}`, `${rawName}--${author}`]);
+    }
+
+    // Two distinct over-long names can cap to the same destination (capping is
+    // a lossy hash). Detect collisions both within this run (claimedDirs) AND
+    // across runs: the manifest persists the raw claimant of an existing capped
+    // install, so a later filtered pull (e.g. `--skill`) of a different raw name
+    // that caps to the same identity is caught. The first raw name to claim a
+    // destination wins; skip any later collider — even under --force — so we
+    // never silently overwrite one skill's file with another's.
+    // Fall back to the entry's `name` for legacy rows recorded before `rawName`
+    // existed: `name` is that install's stable identity, so a colliding new row
+    // is still detected. For a same-skill re-pull the persisted identity equals
+    // this row's own name/rawName, so no false collision fires.
+    const persistedEntry = entriesForRoot(loadManifest(), opts.install, root)
+      .find(e => e.dirName === dirName);
+    const owner = claimedDirs.get(dirName) ?? persistedEntry?.rawName ?? persistedEntry?.name;
+    if (owner !== undefined && owner !== rawName) {
+      summary.entries.push({
+        name: rawName, remoteVersion: Number(row.version ?? 1), localVersion: null,
+        action: "skipped", destination: `(name collision with '${owner}' — skipped)`,
+        author, sourceAgent: String(row.source_agent ?? ""),
+      });
+      summary.skipped++;
+      continue;
+    }
+    claimedDirs.set(dirName, rawName);
+
     const skillDir = join(root, dirName);
     const skillFile = join(skillDir, "SKILL.md");
+
+    // A prior (pre-cap) pull of this same row installed it at the un-capped
+    // `<rawName>--<author>` dir with an invalid (>64) frontmatter name. Decide
+    // on the CAPPED dir's OWN state (not the stale one's) so a fresh capped
+    // install fires even when the remote version is unchanged — the whole point
+    // is to fix that existing broken install, which is normally at an equal
+    // version. Below we either migrate the stale copy's content or install the
+    // remote row, then retire the stale dir.
+    const staleDir = !own && name !== rawName ? `${rawName}--${author}` : null;
+    // Only treat a stale dir as ours to migrate/retire when the manifest says
+    // WE pulled it. An unmanaged `<rawName>--<author>` dir the user happens to
+    // own is left untouched, and its content is never copied into the capped
+    // destination — the remote row installs there as usual.
+    const staleOwned = !!staleDir && staleDir !== dirName
+      && entriesForRoot(loadManifest(), opts.install, root).some(e => e.dirName === staleDir);
+    const staleFile = staleOwned ? join(root, staleDir!, "SKILL.md") : null;
+    const staleVersion = staleFile && existsSync(staleFile) ? readLocalVersion(staleFile) : null;
+
     const remoteVersion = Number(row.version ?? 1);
     const localVersion = readLocalVersion(skillFile);
+    // The slot holds the user's own chain, and this row is a survivor by
+    // another author that merged it: the versions are from different chains,
+    // so the slot is replaced (the old file stays as SKILL.md.bak).
+    const slotIsMyMergedChain = own && author !== opts.selfAuthor
+      && readLocalAuthor(skillFile) === opts.selfAuthor;
     const action = decideAction({
       remoteVersion, localVersion,
-      force: opts.force ?? false,
+      force: (opts.force ?? false) || slotIsMyMergedChain,
       dryRun: opts.dryRun ?? false,
     });
+
+    // The user's own locally-mined skill in this slot is theirs, not pull's:
+    // update it to the newer version, but never record it, so `unpull`
+    // cannot delete it. A survivor by another author is pull-managed.
+    const unmanagedLocal = own && author === opts.selfAuthor && localVersion !== null
+      && !entriesForRoot(loadManifest(), opts.install, root).some(e => e.dirName === dirName);
 
     let manifestError: string | undefined;
     if (action === "wrote") {
       mkdirSync(skillDir, { recursive: true });
-      // Backup any existing file before overwriting (only if it was non-null
-      // and we're actually writing).
+      // Backup any existing capped file before overwriting.
       if (existsSync(skillFile)) {
         try { renameSync(skillFile, `${skillFile}.bak`); } catch { /* best effort */ }
       }
-      writeFileSync(skillFile, renderSkillFile(row));
+      // Preserve the stale copy's content whenever it is NOT older than the
+      // remote row (equal version = possible un-versioned local edits) and
+      // we're not forcing: migrate it — with the invalid frontmatter name
+      // rewritten to the capped one — instead of overwriting from remote.
+      // Only an older stale copy (or --force) is replaced by the remote row.
+      if (staleFile && staleVersion !== null && staleVersion >= remoteVersion && !(opts.force ?? false)) {
+        // Read defensively: if the stale file vanished since its version was
+        // read (a benign FS race), fall back to installing the remote row
+        // rather than throwing out of the pull.
+        try {
+          const migrated = readFileSync(staleFile, "utf-8").replace(/^name:.*$/m, `name: ${name}`);
+          writeFileSync(skillFile, migrated);
+        } catch {
+          writeFileSync(skillFile, renderSkillFile(row, name));
+        }
+      } else {
+        writeFileSync(skillFile, renderSkillFile(row, name));
+      }
       // Fan out symlinks into every detected non-Claude agent skills
       // root, but only for global pulls. Project-local pulls live under
       // <cwd>/.claude/skills and shouldn't leak into user-global agent
       // dirs — that would defeat the project-scoping intent.
-      const symlinks = opts.install === "global"
+      const symlinks = opts.install === "global" && !unmanagedLocal
         ? fanOutSymlinks(skillDir, dirName, detectAgentSkillsRoots(root))
         : [];
       // Record in manifest so `unpull` can identify this entry as
       // pull-managed without relying on the `--<author>` dirname heuristic
       // and so the symlinks created above can be reversed by a single
       // manifest-driven unlink pass.
+      if (!unmanagedLocal) {
+        try {
+          recordPull({
+            dirName,
+            name,
+            rawName,
+            author,
+            projectKey: String(row.project_key ?? ""),
+            remoteVersion,
+            install: opts.install,
+            installRoot: root,
+            pulledAt: new Date().toISOString(),
+            symlinks,
+          });
+        } catch (e: any) {
+          // Skill is on disk but the manifest didn't record it — surface
+          // this in the entry so the dispatcher can warn. `unpull` will
+          // not be able to clean this entry via the manifest path until
+          // a successful re-pull populates it.
+          manifestError = e?.message ?? String(e);
+        }
+      }
+    }
+
+    // Retire the stale un-capped dir once a valid capped install is in place —
+    // whether we wrote it this run or a previous run did. Running independently
+    // of `action` means a cleanup that failed earlier (transient rmSync error →
+    // a later "skipped" pull) is retried instead of leaving the invalid dir
+    // forever. ONLY a dir we manage (present in the manifest) is removed — a
+    // user-created `<rawName>--<author>` dir is never touched. dry-run safe;
+    // failures surface via manifestError rather than aborting the pull.
+    if (staleDir && staleDir !== dirName && !(opts.dryRun ?? false)
+        && existsSync(skillFile) && existsSync(join(root, staleDir))) {
       try {
-        recordPull({
-          dirName,
-          name,
-          author,
-          projectKey: String(row.project_key ?? ""),
-          remoteVersion,
-          install: opts.install,
-          installRoot: root,
-          pulledAt: new Date().toISOString(),
-          symlinks,
-        });
+        const entries = entriesForRoot(loadManifest(), opts.install, root);
+        // Only retire the stale install once the CANONICAL capped install is
+        // recorded in the manifest. If recordPull failed this run, the canonical
+        // file is on disk but untracked — keep the stale entry so a later pull
+        // retries the migration instead of orphaning the skill.
+        let canonicalRecorded = entries.some(e => e.dirName === dirName);
+        const staleEntry = entries.find(e => e.dirName === staleDir);
+        // A prior run wrote the capped file but its recordPull failed, so this
+        // run saw the file at the remote version and chose "skipped" (no
+        // recordPull). Adopt the untracked canonical now — otherwise
+        // `canonicalRecorded` stays false forever and the stale dir is never
+        // retired. Skip if recordPull just failed THIS run (`manifestError`
+        // set) so we don't retry a still-broken manifest write.
+        if (!canonicalRecorded && staleEntry && !manifestError) {
+          try {
+            const symlinks = opts.install === "global"
+              ? fanOutSymlinks(skillDir, dirName, detectAgentSkillsRoots(root))
+              : [];
+            recordPull({
+              dirName, name, rawName, author,
+              projectKey: String(row.project_key ?? ""),
+              remoteVersion, install: opts.install, installRoot: root,
+              pulledAt: new Date().toISOString(), symlinks,
+            });
+            canonicalRecorded = true;
+          } catch (e: any) {
+            manifestError = manifestError ?? (e?.message ?? String(e));
+          }
+        }
+        if (canonicalRecorded && staleEntry) {
+          // Remove the directory FIRST, then drop its manifest evidence. If
+          // rmSync fails, the entry survives so the next pull retries cleanup;
+          // dropping the entry first would orphan an un-removed invalid dir.
+          rmSync(join(root, staleDir), { recursive: true, force: true });
+          unlinkSymlinks(staleEntry.symlinks);
+          removePullEntry(opts.install, staleEntry.installRoot, staleDir);
+        }
       } catch (e: any) {
-        // Skill is on disk but the manifest didn't record it — surface
-        // this in the entry so the dispatcher can warn. `unpull` will
-        // not be able to clean this entry via the manifest path until
-        // a successful re-pull populates it.
-        manifestError = e?.message ?? String(e);
+        manifestError = manifestError ?? (e?.message ?? String(e));
       }
     }
 

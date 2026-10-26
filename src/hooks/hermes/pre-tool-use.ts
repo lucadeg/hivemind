@@ -21,11 +21,13 @@
  */
 
 import { readStdin } from "../../utils/stdin.js";
-import { loadConfig } from "../../config.js";
+import { loadRoutedConfig, isHivemindEnabled } from "../../dir-config.js";
 import { DeeplakeApi } from "../../deeplake-api.js";
 import { log as _log } from "../../utils/debug.js";
 import { parseBashGrep, handleGrepDirect } from "../grep-direct.js";
 import { touchesMemory, rewritePaths } from "../memory-path-utils.js";
+import { tryGraphRead } from "../../graph/graph-command.js";
+import { armSkillOptOnSkillUse } from "../shared/skillopt-hook.js";
 const log = (msg: string) => _log("hermes-pre-tool-use", msg);
 
 interface HermesPreToolUseInput {
@@ -39,6 +41,10 @@ interface HermesPreToolUseInput {
 
 async function main(): Promise<void> {
   const input = await readStdin<HermesPreToolUseInput>();
+  if (!isHivemindEnabled(input.cwd ?? process.cwd())) return; // .hivemind "collect": false → fully inactive
+  // SkillOpt: hermes USES an org skill by shelling a read of its SKILL.md (the path is in the
+  // terminal command). Arm the judgment window on it. Swallowed; never affects the decision below.
+  armSkillOptOnSkillUse(input.session_id ?? "", input.tool_name ?? "", input.tool_input);
   // Hermes' shell-hook tool name for terminal commands is "terminal".
   if (input.tool_name !== "terminal") return;
 
@@ -48,10 +54,21 @@ async function main(): Promise<void> {
   if (!touchesMemory(command)) return;
 
   const rewritten = rewritePaths(command);
+
+  // Graph VFS dispatch — a cat/head/tail/ls on the `/graph/*` subtree is
+  // answered from the local snapshot, no SQL, no config needed. Runs before
+  // grep handling. Shared parser: src/graph/graph-command.ts.
+  const graphBody = tryGraphRead(rewritten, input.cwd ?? process.cwd());
+  if (graphBody !== null) {
+    log(`graph vfs intercept: ${command.slice(0, 80)}`);
+    process.stdout.write(JSON.stringify({ action: "block", message: graphBody }));
+    return;
+  }
+
   const grepParams = parseBashGrep(rewritten);
   if (!grepParams) return; // not grep/rg/egrep/fgrep — leave it alone
 
-  const config = loadConfig();
+  const config = loadRoutedConfig(input.cwd ?? process.cwd());
   if (!config) {
     log("no config — falling through to Hermes");
     return;

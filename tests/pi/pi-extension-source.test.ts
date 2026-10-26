@@ -19,7 +19,7 @@ import { join } from "node:path";
  */
 
 const PI_SRC = readFileSync(
-  join(process.cwd(), "pi", "extension-source", "hivemind.ts"),
+  join(process.cwd(), "harnesses", "pi", "extension-source", "hivemind.ts"),
   "utf-8",
 );
 
@@ -32,6 +32,74 @@ describe("pi extension — embedding wiring", () => {
     expect(insertLine![0]).toContain("message_embedding");
   });
 
+  // Regression for C1 (duplicate session rows). The sessions table has no
+  // UNIQUE constraint on id, so a plain `INSERT ... VALUES` that gets re-sent
+  // (retry after a transient error) creates a duplicate. pi must build the row
+  // idempotently — `INSERT ... SELECT ... WHERE NOT EXISTS (id = ...)` — matching
+  // the shared buildDirectSessionInsertSql helper the bundled agents use.
+  it("builds the sessions INSERT idempotently (no bare VALUES insert)", () => {
+    expect(PI_SRC).toMatch(
+      /INSERT INTO "\$\{SESSIONS_TABLE\}"[\s\S]*?WHERE NOT EXISTS \(SELECT 1 FROM "\$\{SESSIONS_TABLE\}" WHERE id = '\$\{rowId\}'\)/,
+    );
+    // ...and never the duplicate-prone bare VALUES form for the sessions row.
+    expect(PI_SRC).not.toMatch(
+      /INSERT INTO "\$\{SESSIONS_TABLE\}" \([^)]*message_embedding[^)]*\)\s*VALUES/,
+    );
+  });
+
+  // Regression for the pi `plugin_version` 42703 incident (org c2d29f27 et al.):
+  // the pi extension hard-codes its sessions CREATE TABLE inline (it does NOT go
+  // through DeeplakeApi.ensureSessionsTable / healMissingColumns like the other
+  // agents). When `plugin_version` was added to the canonical SESSIONS_COLUMNS
+  // (2026-05-18) the pi INSERT picked it up but the inline CREATE did not, so
+  // every pi-created sessions table was one column short from birth and every
+  // INSERT failed with `column "plugin_version" ... does not exist` — with no
+  // heal to recover. This invariant locks INSERT ⊆ CREATE so the schemas can
+  // never silently drift again.
+  function sessionsInsertColumns(): string[] {
+    const m = PI_SRC.match(/INSERT INTO "\$\{SESSIONS_TABLE\}"\s*\(([^)]+)\)/);
+    expect(m).not.toBeNull();
+    return m![1].split(",").map(c => c.trim().toLowerCase());
+  }
+  function sessionsCreateColumns(): string[] {
+    const block = PI_SRC.match(/const sessCreate =([\s\S]*?)USING deeplake/);
+    expect(block).not.toBeNull();
+    const cols = new Set<string>();
+    for (const m of block![1].matchAll(
+      /[(,`]\s*([a-z_][a-z0-9_]*)\s+(?:TEXT|JSONB|FLOAT4|BIGINT|INT|BOOLEAN|DOUBLE)/gi,
+    )) {
+      cols.add(m[1].toLowerCase());
+    }
+    return [...cols];
+  }
+
+  it("every column the sessions INSERT writes exists in the sessions CREATE TABLE", () => {
+    const created = new Set(sessionsCreateColumns());
+    const missing = sessionsInsertColumns().filter(c => !created.has(c));
+    expect(missing).toEqual([]);
+  });
+
+  it("plugin_version is in both the sessions CREATE and INSERT", () => {
+    expect(sessionsCreateColumns()).toContain("plugin_version");
+    expect(sessionsInsertColumns()).toContain("plugin_version");
+  });
+
+  // The CREATE/INSERT invariants above only protect FRESH tables. Existing
+  // 13-column pi tables (the actual prod incident — org c2d29f27) are recovered
+  // by the session_start SCHEMA_HEAL pass. Guard that contract too: dropping
+  // plugin_version from the heal, or no longer healing MEMORY_TABLE, would
+  // silently re-break pre-existing tables while the suite stayed green.
+  it("session_start SCHEMA_HEAL heals sessions + memory tables for plugin_version", () => {
+    const block = PI_SRC.match(/const SCHEMA_HEAL[^=]*=\s*\[([\s\S]*?)\];/);
+    expect(block).not.toBeNull();
+    const heal = block![1];
+    expect(heal).toContain("SESSIONS_TABLE");
+    expect(heal).toContain("MEMORY_TABLE");
+    const pluginVersionHeals =
+      heal.match(/\["plugin_version",\s*"TEXT NOT NULL DEFAULT ''"\]/g) ?? [];
+    expect(pluginVersionHeals.length).toBeGreaterThanOrEqual(2);
+  });
+
   it("auto-spawn target is the canonical shared-deps daemon path", () => {
     expect(PI_SRC).toContain('".hivemind"');
     expect(PI_SRC).toContain('"embed-deps"');
@@ -39,7 +107,66 @@ describe("pi extension — embedding wiring", () => {
   });
 
   it("uses the same UID-keyed socket convention as EmbedClient", () => {
-    expect(PI_SRC).toMatch(/\/tmp\/hivemind-embed-\$\{uid\}\.sock/);
+    // Pattern: /tmp/hivemind-embed-${SOMETHING_UID}.sock — the UID identifier
+    // moved from a closure-scoped `uid` to the module-level `EMBED_UID` when
+    // the spawn-on-miss helper was added (issue #178), but the convention
+    // itself — UID-keyed per-user socket under /tmp — must stay locked.
+    expect(PI_SRC).toMatch(/\/tmp\/hivemind-embed-\$\{[A-Z_a-z]*[Uu][Ii][Dd][A-Z_a-z]*\}\.sock/);
+  });
+
+  it("uses an O_EXCL pidfile lock to prevent duplicate daemon spawns", () => {
+    // Without this, two pi turns (or pi + another agent) racing to embed
+    // would both call spawn() and the second daemon would crash on bind.
+    // The fix for issue #178 routes spawn through openSync(pidPath, "wx").
+    expect(PI_SRC).toMatch(/openSync\(\s*EMBED_PID_PATH\s*,\s*"wx"/);
+  });
+
+  it("respects an alive pidfile owner instead of SIGTERMing it", () => {
+    // PR #168's lesson, mirrored here: a stale-looking pidfile with a
+    // live PID is most likely another agent in the middle of bringing
+    // the daemon up. Killing it would race with a possibly-recycled OS
+    // pid (PR #168 reproduced the exact harm in src/embeddings/client.ts).
+    // We require the inline helper to call isPidAlive but never SIGTERM
+    // the daemon — the only allowed kill is the liveness probe `kill(pid, 0)`.
+    expect(PI_SRC).toContain("isPidAlive");
+    // Allowed: `process.kill(pid, 0)` — liveness probe used inside
+    // isPidAlive(). Any OTHER process.kill(...) is forbidden, including
+    // the bare `process.kill(pid)` form which Node treats as SIGTERM by
+    // default.
+    expect(PI_SRC).toMatch(/process\.kill\(\s*pid\s*,\s*0\s*\)/);
+    const withoutLivenessProbe = PI_SRC.replace(/process\.kill\(\s*pid\s*,\s*0\s*\)/g, "");
+    expect(withoutLivenessProbe).not.toMatch(/process\.kill\(/);
+  });
+
+  it("treats an empty pidfile as 'writer in progress' to avoid duplicate spawns", () => {
+    // The catch-after-openSync(wx) branch MUST short-circuit on empty
+    // pidfile, not unlink + retry. Without this, two pi turns racing
+    // openSync(wx) can both end up calling spawn(): caller A wins
+    // openSync but hasn't yet writeSync'd its PID, caller B sees the
+    // empty pidfile, treats it as stale, unlinks, and spawns too.
+    // The second daemon crashes on bind().
+    expect(PI_SRC).toMatch(/if\s*\(\s*existing\s*===\s*"empty"\s*\)\s*return\s+false/);
+  });
+
+  it("cleans up own placeholder PID after spawnWaitMs timeout (enables retry)", () => {
+    // If trySpawnDaemonInline wrote our placeholder PID and the daemon
+    // never opened a socket, the pidfile still holds our PID. Every
+    // subsequent pi turn sees "live owner" (we're alive) and waits
+    // forever instead of retrying the spawn. Source must call
+    // maybeCleanupOwnPlaceholderInline on the timeout path.
+    expect(PI_SRC).toContain("maybeCleanupOwnPlaceholderInline");
+    // The cleanup must be guarded on "still ours" — never blindly unlink
+    // (a fresh daemon may have already overwritten the placeholder).
+    expect(PI_SRC).toMatch(/existing\s*===\s*process\.pid/);
+  });
+
+  it("validates daemon embedding payload is finite numbers", () => {
+    // JSON from the socket is untrusted at runtime. A misbehaving / older
+    // daemon could ship strings or NaN that flow into the ARRAY[...] SQL
+    // literal. The inline sendEmbedRequest must reject any non-finite
+    // element before returning the vector.
+    expect(PI_SRC).toMatch(/Number\.isFinite\(/);
+    expect(PI_SRC).toMatch(/typeof\s+v\s*!==\s*"number"/);
   });
 
   it("speaks the daemon's protocol shape exactly: {op:'embed', id, kind, text}", () => {
@@ -131,5 +258,172 @@ describe("pi extension — embedding wiring", () => {
   it("emits NULL (not a malformed literal) when no embedding is available", () => {
     // embedSqlLiteral(null) → "NULL" — guards against `ARRAY[]::FLOAT4[]` slipping in.
     expect(PI_SRC).toMatch(/return\s+"NULL"/);
+  });
+});
+
+describe("pi extension — SkillOpt wiring", () => {
+  it("arms on a SKILL.md READ in the tool_result handler (non-error reads only, read tools only)", () => {
+    // pi has no first-class Skill tool — it USES a skill by reading its SKILL.md, so arming hangs
+    // off tool_result, gated on a successful read. The toolName is passed so arming is restricted
+    // to read tools (an edit/write of a SKILL.md must not arm).
+    expect(PI_SRC).toContain("skilloptArm(sessionId, event.toolName, event.input, event.toolCallId)");
+    expect(PI_SRC).toContain("event.isError !== true");
+    expect(PI_SRC).toMatch(/\/\^read\/i\.test/); // arm restricted to read tools
+    expect(PI_SRC).toContain("/skills/"); // the ref-from-path matcher targets …/skills/<ref>/SKILL.md
+  });
+
+  it("reacts on the user prompt in the input handler", () => {
+    expect(PI_SRC).toContain("skilloptReact(sessionId, text)");
+  });
+
+  it("spawns the bundled skillopt-worker with the cross-process env contract", () => {
+    expect(PI_SRC).toContain('"skillopt-worker.js"');
+    // these env-var names MUST match SKILLOPT_ENV — the worker reads the literals back
+    for (const v of [
+      "HIVEMIND_SKILLOPT_WORKER", "HIVEMIND_SKILLOPT_SESSION", "HIVEMIND_SKILLOPT_SKILL",
+      "HIVEMIND_SKILLOPT_REACTION", "HIVEMIND_SKILLOPT_AGENT",
+    ]) expect(PI_SRC).toContain(v);
+    expect(PI_SRC).toContain('HIVEMIND_SKILLOPT_AGENT: "pi"'); // judge/proposer run on pi
+  });
+
+  it("honors the kill switch + the in-worker recursion guard", () => {
+    expect(PI_SRC).toContain('process.env.HIVEMIND_SKILLOPT_DISABLED === "1"');
+    expect(PI_SRC).toContain('process.env.HIVEMIND_WIKI_WORKER === "1"');
+  });
+
+  it("only arms org-shaped refs (name--author), not bare/plugin skills", () => {
+    expect(PI_SRC).toContain('ref.includes(":")');      // reject plugin-namespaced
+    expect(PI_SRC).toContain('ref.lastIndexOf("--")');  // require name--author
+  });
+});
+
+// Pi is a standalone extension (no shared-module imports), so it carries an
+// inline mirror of src/dir-config.ts. These guard that the per-directory
+// `.hivemind` wiring (opt-out + routing) is present and applied on every
+// capture path — the gap Emanuele flagged on PR #302.
+describe("pi extension — per-directory .hivemind wiring", () => {
+  it("defines the inline resolver over both filenames", () => {
+    expect(PI_SRC).toContain("function findHivemindDir");
+    expect(PI_SRC).toContain("function applyDirConfig");
+    expect(PI_SRC).toContain('".hivemind.local", ".hivemind"');
+  });
+
+  it("honors env precedence (env > file) in the overlay", () => {
+    expect(PI_SRC).toContain("process.env.HIVEMIND_ORG_ID");
+    expect(PI_SRC).toContain("process.env.HIVEMIND_WORKSPACE_ID");
+  });
+
+  it("gates every capture path on the resolved collect flag", () => {
+    // input / tool_result / message_end / session_shutdown each skip on opt-out.
+    const skips = PI_SRC.match(/capture disabled for cwd=\$\{cwd\} via \.hivemind/g) ?? [];
+    expect(skips.length).toBe(4);
+    // and each reassigns creds to the routed identity after the gate.
+    const reassigns = PI_SRC.match(/creds = dirRes\.creds;/g) ?? [];
+    expect(reassigns.length).toBe(4);
+  });
+
+  it("gates session_start table setup on collect and discloses routing", () => {
+    expect(PI_SRC).toContain("creds && captureEnabled && dirCollect");
+    expect(PI_SRC).toContain("routed by .hivemind");
+    expect(PI_SRC).toContain("capture is disabled for this directory");
+  });
+});
+
+describe("pi extension — failed-summary back-off (issue #331)", () => {
+  it("preserves the attempt fields across a state read/write round-trip", () => {
+    // pi rewrites the WHOLE state object into the same dir the shared
+    // wiki-worker finalizes against. Dropping these on read would strip them
+    // from the file and restore the infinite-refire behavior.
+    expect(PI_SRC).toContain("lastAttemptAt: Number(raw.lastAttemptAt) || 0");
+    expect(PI_SRC).toContain("attemptsSinceSuccess: Number(raw.attemptsSinceSuccess) || 0");
+  });
+
+  it("suppresses the trigger while a failed run's back-off window is open", () => {
+    expect(PI_SRC).toMatch(
+      /if \(attempts > 0 && now - \(state\.lastAttemptAt \?\? 0\) < retryBackoffMs\(attempts\)\) return false;/,
+    );
+  });
+
+  it("stamps the attempt after winning the lock, not before", () => {
+    // Stamping in the caller (before tryAcquireSummaryLock) would overwrite a
+    // concurrent worker's finalization with stale counters and would record a
+    // lock-suppressed non-spawn as a failure.
+    const trigger = PI_SRC.slice(
+      PI_SRC.indexOf("function maybeTriggerPeriodicSummary"),
+    );
+    expect(trigger).not.toContain("attemptsSinceSuccess");
+
+    const spawn = PI_SRC.slice(PI_SRC.indexOf("function spawnWikiWorker"));
+    const lockAt = spawn.indexOf("tryAcquireSummaryLock(sessionId)");
+    const stampAt = spawn.indexOf("attemptsSinceSuccess: (fresh.attemptsSinceSuccess ?? 0) + 1");
+    expect(lockAt).toBeGreaterThan(-1);
+    expect(stampAt).toBeGreaterThan(lockAt);
+  });
+
+  it("stamps against freshly-read state, not the trigger-time snapshot", () => {
+    const spawn = PI_SRC.slice(PI_SRC.indexOf("function spawnWikiWorker"));
+    expect(spawn).toContain("const fresh = readSummaryState(sessionId)");
+    expect(spawn).toContain("...fresh,");
+  });
+
+  it("does not back off the final session-shutdown summary", () => {
+    const spawn = PI_SRC.slice(PI_SRC.indexOf("function spawnWikiWorker"));
+    expect(spawn).toContain('if (reason === "periodic")');
+  });
+
+  it("caps the back-off at 30 minutes, matching summary-state.ts", () => {
+    expect(PI_SRC).toContain("Math.min(2 ** (attemptsSinceSuccess - 1), 30) * 60 * 1000");
+  });
+});
+
+describe("pi extension — #331 review follow-ups", () => {
+  it("fails closed when the attempt stamp cannot be persisted", () => {
+    // A spawn we cannot record is exactly the bug: the next captured event
+    // refires immediately. Release the lock and skip instead.
+    const spawn = PI_SRC.slice(PI_SRC.indexOf("function spawnWikiWorker"));
+    expect(spawn).toContain("if (!stamped) {");
+    const stampedAt = spawn.indexOf("if (!stamped) {");
+    const releaseAt = spawn.indexOf("releaseSummaryLock(sessionId)", stampedAt);
+    const returnAt = spawn.indexOf("return;", releaseAt);
+    expect(releaseAt).toBeGreaterThan(stampedAt);
+    expect(returnAt).toBeGreaterThan(releaseAt);
+  });
+
+  it("writeSummaryState reports failure rather than swallowing it", () => {
+    expect(PI_SRC).toMatch(/function writeSummaryState\([^)]*\): boolean \{/);
+    expect(PI_SRC).toContain("} catch { return false; }");
+  });
+
+  it("honors HIVEMIND_WIKI_WORKER=1 for the final summary too, not just periodic", () => {
+    // README's Configuration table promises this disables the background
+    // summary worker ENTIRELY. Guarding only maybeTriggerPeriodicSummary
+    // would leave session_shutdown's "final" spawn running, making the
+    // documentation false.
+    const spawn = PI_SRC.slice(PI_SRC.indexOf("function spawnWikiWorker"));
+    const guardAt = spawn.indexOf('process.env.HIVEMIND_WIKI_WORKER === "1"');
+    const lockAt = spawn.indexOf("tryAcquireSummaryLock(sessionId)");
+    expect(guardAt).toBeGreaterThan(-1);
+    // and it gates BEFORE the lock, so a disabled worker never takes one
+    expect(lockAt).toBeGreaterThan(guardAt);
+  });
+
+  it("releases the lock on config-write failure", () => {
+    // pi's tryAcquireSummaryLock has no stale reclaim, so any leaked lock is
+    // held for the rest of the session and skips every later spawn.
+    const spawn = PI_SRC.slice(PI_SRC.indexOf("function spawnWikiWorker"));
+    const writeFail = spawn.indexOf("writeFileSync failed");
+    const release = spawn.indexOf("releaseSummaryLock(sessionId)", writeFail);
+    const ret = spawn.indexOf("return;", release);
+    expect(writeFail).toBeGreaterThan(-1);
+    expect(release).toBeGreaterThan(writeFail);
+    expect(ret).toBeGreaterThan(release);
+  });
+
+  it("releases the lock on both sync and async spawn failure", () => {
+    const spawn = PI_SRC.slice(PI_SRC.indexOf("function spawnWikiWorker"));
+    // async 'error' (ENOENT/EPERM arrive as an event, not a throw)
+    expect(spawn).toMatch(/child\.on\("error"[\s\S]{0,220}releaseSummaryLock\(sessionId\)/);
+    // sync throw
+    expect(spawn).toMatch(/spawn failed[\s\S]{0,120}releaseSummaryLock\(sessionId\)/);
   });
 });

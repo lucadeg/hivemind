@@ -10,12 +10,16 @@
 
 import { readStdin } from "../utils/stdin.js";
 import { loadConfig, type Config } from "../config.js";
+import { resolveDirConfig } from "../dir-config.js";
 import { log as _log } from "../utils/debug.js";
 import { bundleDirFromImportMeta, spawnWikiWorker, wikiLog } from "./spawn-wiki-worker.js";
-import { tryAcquireLock, releaseLock } from "./summary-state.js";
+import { tryAcquireLock, releaseLock, markSessionEnded } from "./summary-state.js";
+import { pruneStaleSessionEventCaches } from "./session-event-cache.js";
 import { forceSessionEndTrigger } from "../skillify/triggers.js";
 import { parseTranscript } from "../notifications/transcript-parser.js";
 import { appendUsageRecord } from "../notifications/usage-tracker.js";
+import { entrypointPassesOnlyCliGate } from "./shared/capture-gate.js";
+import { isHivemindPluginEnabled } from "../utils/plugin-state.js";
 
 const log = (msg: string) => _log("session-end", msg);
 
@@ -51,20 +55,56 @@ function recordSessionUsage(transcriptPath: string | undefined, sessionId: strin
 async function main(): Promise<void> {
   if (process.env.HIVEMIND_WIKI_WORKER === "1") return;
   if (process.env.HIVEMIND_CAPTURE === "false") return;
+  if (!isHivemindPluginEnabled()) { log("plugin disabled, skipping session-end"); return; }
+  if (!entrypointPassesOnlyCliGate()) return;
 
   const input = await readStdin<StopInput>();
   const sessionId = input.session_id;
   const cwd = input.cwd ?? "";
   if (!sessionId) return;
 
-  const config = loadConfig();
-  if (!config) { log("no config"); return; }
+  // Mark this session cleanly ended so another session's resume brief stops
+  // treating it as live and may surface it immediately (without waiting for
+  // the activity window to lapse). Independent of the wiki-worker lock below.
+  markSessionEnded(sessionId);
+
+  // Housekeeping: drop long-dead per-session event caches (14-day TTL). This
+  // session's own cache has a fresh mtime and is left intact for the worker.
+  try { pruneStaleSessionEventCaches(); } catch { /* best-effort */ }
+
+  const base = loadConfig();
+  if (!base) { log("no config"); return; }
+
+  // Per-directory `.hivemind`: honor opt-out and trusted org/workspace routing,
+  // matching the capture hook so the end-of-session summary lands (or doesn't)
+  // in the same place its events did.
+  const resolved = resolveDirConfig(base, cwd || process.cwd());
+  if (!resolved.collect) {
+    log(`session-end capture disabled for cwd=${cwd || "?"} via ${resolved.found?.path}`);
+    return;
+  }
+  const config = resolved.config;
 
   // Record memory-search activity for the savings recap. Independent of the
   // wiki-worker lock below: even sessions where the wiki worker can't run
   // should still contribute to the recap (only need memory-grep counts,
   // not summaries).
   recordSessionUsage(input.transcript_path, sessionId);
+
+  // (SkillOpt is NOT fired from SessionEnd — it fires immediately on the user's reaction
+  // via UserPromptSubmit, so there's nothing to do at session end.)
+
+  // Skillify has its own per-project lock and must fire regardless of whether
+  // the wiki-worker lock below is already held. Fire it here, before the
+  // wiki-worker lock check, so a Periodic trigger that acquired the lock first
+  // doesn't silently suppress skill mining.
+  forceSessionEndTrigger({
+    config,
+    cwd: cwd || process.cwd(),
+    bundleDir: bundleDirFromImportMeta(import.meta.url),
+    agent: "claude_code",
+    sessionId,
+  });
 
   // Coordinate with the periodic worker: if one is already running for this
   // session, skip. Two workers writing the same summary row trip the
@@ -96,13 +136,7 @@ async function main(): Promise<void> {
     throw e;
   }
 
-  forceSessionEndTrigger({
-    config,
-    cwd,
-    bundleDir: bundleDirFromImportMeta(import.meta.url),
-    agent: "claude_code",
-    sessionId,
-  });
+  // (forceSessionEndTrigger already called above, before the wiki-worker lock check)
 }
 
 main().catch((e) => { log(`fatal: ${e.message}`); process.exit(0); });

@@ -5,7 +5,7 @@
  *
  *   1. `SKILLIFY_COMMANDS` — flat one-line-per-entry. Consumed by the four
  *      per-agent SessionStart inject blocks (claude-code/codex/cursor/hermes),
- *      the pi mirror in `pi/extension-source/hivemind.ts`, and the bundle-scan
+ *      the pi mirror in `harnesses/pi/extension-source/hivemind.ts`, and the bundle-scan
  *      tests that assert specific subcommand strings appear verbatim in the
  *      shipped JS. Kept as a literal array (not derived) so esbuild preserves
  *      every entry as a string literal in the bundle.
@@ -42,14 +42,20 @@ export const SKILLIFY_COMMANDS: SkillifyCommand[] = [
   { cmd: "hivemind skillify pull --user <email>",        desc: "only skills authored by that user" },
   { cmd: "hivemind skillify pull --users <a,b,c>",       desc: "only skills from those authors" },
   { cmd: "hivemind skillify pull --all-users",           desc: 'explicit "no author filter" (default)' },
-  { cmd: "hivemind skillify pull --to <project|global>", desc: "install location (project=cwd/.claude/skills, global=~/.claude/skills)" },
+  { cmd: "hivemind skillify pull --to <project|global>", desc: "install location (project=cwd/.claude/skills, global=~/.claude/skills, linked for Codex/Hermes/pi)" },
   { cmd: "hivemind skillify pull --dry-run",             desc: "preview without touching disk" },
   { cmd: "hivemind skillify pull --force",               desc: "overwrite local files even if up-to-date (creates .bak)" },
   { cmd: "hivemind skillify pull <skill-name>",          desc: "pull only that one skill (combines with --user)" },
+  { cmd: "hivemind skillify push <skill-name>",          desc: "upload a local skill to the org table (inverse of pull)" },
+  { cmd: "hivemind skillify push --from <project|global>", desc: "which local skills dir to read (default: project)" },
+  { cmd: "hivemind skillify push --dry-run",             desc: "preview without writing to the org table" },
   { cmd: "hivemind skillify unpull",                     desc: "remove every skill previously installed by pull" },
   { cmd: "hivemind skillify unpull --user <email>",      desc: "remove only that author's pulls" },
   { cmd: "hivemind skillify unpull --not-mine",          desc: "remove all pulls except your own" },
   { cmd: "hivemind skillify unpull --dry-run",           desc: "preview without touching disk" },
+  { cmd: "hivemind skillify dedupe",                     desc: "one skill per name: remove pulled <name>--<you> copies of your own skills, merge same-name skills from several authors in the org table into one" },
+  { cmd: "hivemind skillify dedupe --no-merge",          desc: "only remove own copies; no cross-author merge" },
+  { cmd: "hivemind skillify dedupe --dry-run",           desc: "preview without touching the table or disk" },
   { cmd: "hivemind skillify scope <me|team|org>",        desc: "sharing scope for newly mined skills" },
   { cmd: "hivemind skillify install <project|global>",   desc: "default install location for new skills" },
   { cmd: "hivemind skillify promote <skill-name>",       desc: "move a project skill to the global location" },
@@ -97,12 +103,22 @@ export const SKILLIFY_SPEC: SkillifySubcommand[] = [
       { flag: "--user <email>",          desc: "only skills authored by that user" },
       { flag: "--users <a,b,c>",         desc: "only skills from those authors" },
       { flag: "--all-users",             desc: 'explicit "no author filter" (default)' },
-      { flag: "--to <project|global>",   desc: "install location (project=cwd/.claude/skills, global=~/.claude/skills)" },
+      { flag: "--to <project|global>",   desc: "install location (project=cwd/.claude/skills, global=~/.claude/skills, linked for Codex/Hermes/pi)" },
       { flag: "--dry-run",               desc: "preview without touching disk" },
       { flag: "--force",                 desc: "overwrite local files even if up-to-date (creates .bak)" },
       { flag: "<skill-name>",            desc: "pull only that one skill (combines with --user)" },
     ],
     note: "every agent's SessionStart hook auto-runs 'pull --all-users --to global' on every session. File writes are idempotent (skipped when local is at-or-newer than remote). Disable via HIVEMIND_AUTOPULL_DISABLED=1.",
+  },
+  {
+    cmd: "hivemind skillify push",
+    args: "<skill-name>",
+    desc: "upload a local skill to the org table (inverse of pull)",
+    options: [
+      { flag: "--from <project|global>", desc: "which local skills dir to read (default: project)" },
+      { flag: "--dry-run",               desc: "preview without writing to the org table" },
+    ],
+    note: "the manual counterpart to mining — push a skill Claude wrote locally straight to the org table (append-only: re-pushing an existing skill lands a new version). Authorship/lineage is preserved; you're added as a contributor.",
   },
   {
     cmd: "hivemind skillify unpull",
@@ -111,6 +127,14 @@ export const SKILLIFY_SPEC: SkillifySubcommand[] = [
       { flag: "--user <email>",          desc: "remove only that author's pulls" },
       { flag: "--not-mine",              desc: "remove all pulls except your own" },
       { flag: "--dry-run",               desc: "preview without touching disk" },
+    ],
+  },
+  {
+    cmd: "hivemind skillify dedupe",
+    desc: "one skill per name: remove pulled <name>--<you> copies of your own skills, merge same-name skills from several authors in the org table into one",
+    options: [
+      { flag: "--no-merge",              desc: "only remove own copies; no cross-author merge" },
+      { flag: "--dry-run",               desc: "preview without touching the table or disk" },
     ],
   },
   {

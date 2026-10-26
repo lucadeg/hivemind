@@ -1,13 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 
 import { spawnWikiWorker, bundleDirFromImportMeta, findClaudeBin } from "../../src/hooks/spawn-wiki-worker.js";
-import { spawnCodexWikiWorker } from "../../src/hooks/codex/spawn-wiki-worker.js";
-import { spawnCursorWikiWorker } from "../../src/hooks/cursor/spawn-wiki-worker.js";
-import { spawnHermesWikiWorker } from "../../src/hooks/hermes/spawn-wiki-worker.js";
+import {
+  spawnCodexWikiWorker,
+  findCodexBin,
+  bundleDirFromImportMeta as codexBundleDir,
+} from "../../src/hooks/codex/spawn-wiki-worker.js";
+import {
+  spawnCursorWikiWorker,
+  findCursorBin,
+  bundleDirFromImportMeta as cursorBundleDir,
+} from "../../src/hooks/cursor/spawn-wiki-worker.js";
+import {
+  spawnHermesWikiWorker,
+  findHermesBin,
+  bundleDirFromImportMeta as hermesBundleDir,
+} from "../../src/hooks/hermes/spawn-wiki-worker.js";
 import type { Config } from "../../src/config.js";
+import { setFakeHome, clearFakeHome } from "../shared/fake-home.js";
 
 /**
  * Per-agent guard for the spawn-wiki-worker helpers.
@@ -16,7 +31,11 @@ import type { Config } from "../../src/config.js";
  *   1. Reads the installed plugin version via getInstalledVersion(bundleDir, manifestDir)
  *      — the manifest dir differs per agent (".claude-plugin" / ".codex-plugin").
  *   2. Writes a config.json the detached worker reads at startup.
- *   3. Spawns `nohup node <worker.js> <config.json>`.
+ *   3. Spawns `<node> <worker.js> <config.json>` detached, via the shared
+ *      spawnDetachedNodeWorker helper. Cross-platform: it invokes the node
+ *      binary directly (process.execPath), NOT `nohup node ...` — `nohup` is
+ *      absent on Windows and the old form crashed the hook there with an
+ *      unhandled async ENOENT. See src/utils/spawn-detached.ts.
  *
  * The thing the e2e on test_plugin couldn't directly observe is whether
  * pluginVersion actually lands in config.json for every agent. A regression
@@ -35,11 +54,24 @@ vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   return {
     ...actual,
+    // Delegate to the real execSync by default (the find*Bin "usable string"
+    // tests rely on real `which` behavior); individual tests override per-call
+    // with mock*Once to deterministically hit the resolve/fallback branches.
+    execSync: vi.fn((...args: Parameters<typeof actual.execSync>) => actual.execSync(...args)),
+    // find*Bin now delegates to resolveCliBin(), which probes the CLI via
+    // execFileSync("which"/"where", [cli]). Delegate to the real impl by
+    // default; per-agent resolver tests override per-call.
+    execFileSync: vi.fn((...args: Parameters<typeof actual.execFileSync>) => actual.execFileSync(...args)),
     spawn: vi.fn((cmd: string, args: readonly string[]) => {
       spawnCalls.push({ cmd, args });
-      // Match the surface the production code touches: a child object
-      // with `.unref()`. No stdio, no event emission.
-      return { unref: () => {} } as unknown as ReturnType<typeof actual.spawn>;
+      // Match the surface the production code touches: a child object with
+      // `.on("error", ...)` (the helper installs an async-ENOENT absorber
+      // before unref'ing) and `.unref()`. `.on` returns the child for chaining.
+      const child: { on: () => typeof child; unref: () => void } = {
+        on: () => child,
+        unref: () => {},
+      };
+      return child as unknown as ReturnType<typeof actual.spawn>;
     }),
   };
 });
@@ -55,12 +87,11 @@ beforeEach(() => {
   fakeHome = join(scratchRoot, "home");
   mkdirSync(fakeHome, { recursive: true });
   originalHome = process.env.HOME;
-  process.env.HOME = fakeHome;
+  setFakeHome(fakeHome);
 });
 
 afterEach(() => {
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  clearFakeHome();
   rmSync(scratchRoot, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -95,13 +126,19 @@ function fakeConfig(): Config {
     tableName: "memory",
     sessionsTableName: "sessions",
     skillsTableName: "skills",
+    rulesTableName: "hivemind_rules",
+    goalsTableName: "hivemind_goals",
+    docsTableName: "hivemind_docs",
+    codebaseTableName: "codebase",
     memoryPath: "/tmp/fake-memory",
   };
 }
 
 function readSpawnedConfig(): Record<string, unknown> {
   expect(spawnCalls).toHaveLength(1);
-  const [, , configPath] = spawnCalls[0].args;
+  // argv is now [workerPath, configPath] (spawn(node, [worker, config])),
+  // so the config path is index 1 — previously index 2 under `nohup node ...`.
+  const [, configPath] = spawnCalls[0].args;
   return JSON.parse(readFileSync(configPath as string, "utf-8"));
 }
 
@@ -141,7 +178,7 @@ describe("spawnWikiWorker (claude-code) — plugin_version threading", () => {
     expect(cfg.pluginVersion).toBe("");
   });
 
-  it("spawns the worker with nohup + the written config path", () => {
+  it("spawns the node binary directly (NOT nohup) with worker + config path", () => {
     const { bundleDir } = plantBundle(".claude-plugin");
     spawnWikiWorker({
       config: fakeConfig(),
@@ -152,10 +189,12 @@ describe("spawnWikiWorker (claude-code) — plugin_version threading", () => {
     });
     expect(spawnCalls).toHaveLength(1);
     const [{ cmd, args }] = spawnCalls;
-    expect(cmd).toBe("nohup");
-    expect(args[0]).toBe("node");
-    expect(args[1]).toBe(join(bundleDir, "wiki-worker.js"));
-    expect((args[2] as string).endsWith("config.json")).toBe(true);
+    // Cross-platform fix: invoke node via process.execPath, never `nohup`
+    // (which ENOENT-crashes the hook on Windows). argv = [worker, config].
+    expect(cmd).toBe(process.execPath);
+    expect(cmd).not.toBe("nohup");
+    expect(args[0]).toBe(join(bundleDir, "wiki-worker.js"));
+    expect((args[1] as string).endsWith("config.json")).toBe(true);
   });
 });
 
@@ -229,12 +268,25 @@ describe("spawnHermesWikiWorker — plugin_version threading", () => {
 });
 
 describe("bundleDirFromImportMeta", () => {
-  it("returns the directory containing the entry module", () => {
-    // Build a file:// URL pointing at a fake bundle file and assert the
-    // result is the parent dir of that file. Mirrors how every hook
-    // bootstrap calls this helper.
-    const fakeUrl = "file:///path/to/some/bundle/capture.js";
-    expect(bundleDirFromImportMeta(fakeUrl)).toBe("/path/to/some/bundle");
+  // Each agent ships its own copy of this helper; assert every copy resolves
+  // the parent dir of the entry module (mirrors how each hook bootstrap calls
+  // it) so no copy drifts or goes uncovered.
+  //
+  // `fileURLToPath` requires a platform-ABSOLUTE path: a POSIX-rooted URL
+  // (`file:///path/...`) throws "File URL path must be absolute" on Windows,
+  // which needs a drive letter (`file:///C:/path/...`). Build the fixture URL
+  // + expected dir from `pathToFileURL` on a real absolute path so the test
+  // is correct on every OS without asserting against a hardcoded string.
+  const isWin = process.platform === "win32";
+  const absDir = isWin ? "C:\\path\\to\\some\\bundle" : "/path/to/some/bundle";
+  const fakeUrl = pathToFileURL(join(absDir, "capture.js")).href;
+  it.each([
+    ["claude", bundleDirFromImportMeta],
+    ["codex", codexBundleDir],
+    ["cursor", cursorBundleDir],
+    ["hermes", hermesBundleDir],
+  ])("%s: returns the directory containing the entry module", (_agent, fn) => {
+    expect(fn(fakeUrl)).toBe(absDir);
   });
 });
 
@@ -248,5 +300,115 @@ describe("findClaudeBin", () => {
     const bin = findClaudeBin();
     expect(typeof bin).toBe("string");
     expect(bin.length).toBeGreaterThan(0);
+  });
+});
+
+describe("per-agent bin resolvers", () => {
+  // Each agent's find<Agent>Bin now delegates to resolveCliBin(cli, fallback),
+  // which probes the CLI cross-platform via execFileSync("which"/"where", [cli])
+  // — `which` on the (Linux) test host — and falls back to the literal CLI name.
+  // [agent, resolver, literal-fallback, expected cli arg] — the last column
+  // pins each resolver to the RIGHT CLI name so a copy probing the wrong binary
+  // (e.g. cursor probing `codex`) is caught.
+  const RESOLVERS: Array<[string, () => string, string, string]> = [
+    ["codex", findCodexBin, "codex", "codex"],
+    ["cursor", findCursorBin, "cursor-agent", "cursor-agent"],
+    ["hermes", findHermesBin, "hermes", "hermes"],
+  ];
+
+  // resolveCliBin probes the PATH with the platform-native lookup command:
+  // `which` on POSIX, `where` on Windows. The mock returns the same canned
+  // path regardless, so only the asserted command name is platform-dependent.
+  const lookupCmd = process.platform === "win32" ? "where" : "which";
+
+  it.each(RESOLVERS)("find%sBin returns the resolved path when the lookup succeeds", (_n, fn, _fallback, cli) => {
+    vi.mocked(execFileSync).mockReturnValueOnce("/usr/local/bin/the-cli\n");
+    expect(fn()).toBe("/usr/local/bin/the-cli");
+    expect(execFileSync).toHaveBeenCalledWith(lookupCmd, [cli], { encoding: "utf-8", windowsHide: true });
+  });
+
+  it.each(RESOLVERS)("find%sBin falls back to the literal name when the lookup fails", (_n, fn, fallback, cli) => {
+    vi.mocked(execFileSync).mockImplementationOnce(() => { throw new Error("not found"); });
+    expect(fn()).toBe(fallback);
+    expect(execFileSync).toHaveBeenCalledWith(lookupCmd, [cli], { encoding: "utf-8", windowsHide: true });
+  });
+
+  it.each(RESOLVERS)(
+    "find%sBin falls back to the literal name when the lookup prints no matches",
+    (_n, fn, fallback) => {
+      vi.mocked(execFileSync).mockReturnValueOnce("  \n");
+      expect(fn()).toBe(fallback);
+    },
+  );
+});
+
+describe("per-agent plugin_version fallback to '' (orphan bundle)", () => {
+  // Mirrors the claude-code orphan-bundle test for the forked copies: an
+  // unresolvable manifest must thread "" so the DB column gets DEFAULT ''.
+  // Covers the right-hand side of `getInstalledVersion(...) ?? ""`.
+  it("cursor threads '' when the bundle has no resolvable manifest", () => {
+    const bundleDir = join(scratchRoot, "orphan-cursor", "bundle");
+    mkdirSync(bundleDir, { recursive: true });
+    spawnCursorWikiWorker({
+      config: fakeConfig(),
+      sessionId: "s-cur-orphan",
+      cwd: "/work/x",
+      bundleDir,
+      reason: "TestSpawn",
+    });
+    expect(readSpawnedConfig().pluginVersion).toBe("");
+  });
+
+  it("hermes threads '' when the bundle has no resolvable manifest", () => {
+    const bundleDir = join(scratchRoot, "orphan-hermes", "bundle");
+    mkdirSync(bundleDir, { recursive: true });
+    spawnHermesWikiWorker({
+      config: fakeConfig(),
+      sessionId: "s-her-orphan",
+      cwd: "/work/x",
+      bundleDir,
+      reason: "TestSpawn",
+    });
+    expect(readSpawnedConfig().pluginVersion).toBe("");
+  });
+});
+
+describe("agent model/provider env-var overrides (non-default branch)", () => {
+  // The default-branch (env unset → built-in default) is covered by the
+  // spawn tests above; here we set the env vars so the `?? default` short-
+  // circuits to the override side, covering the other branch.
+  afterEach(() => {
+    delete process.env.HIVEMIND_CURSOR_MODEL;
+    delete process.env.HIVEMIND_HERMES_PROVIDER;
+    delete process.env.HIVEMIND_HERMES_MODEL;
+  });
+
+  it("cursor threads HIVEMIND_CURSOR_MODEL into the spawn config", () => {
+    process.env.HIVEMIND_CURSOR_MODEL = "gpt-5-codex";
+    const { bundleDir } = plantBundle(".claude-plugin");
+    spawnCursorWikiWorker({
+      config: fakeConfig(),
+      sessionId: "s-cur-env",
+      cwd: "/work/x",
+      bundleDir,
+      reason: "TestSpawn",
+    });
+    expect(readSpawnedConfig().cursorModel).toBe("gpt-5-codex");
+  });
+
+  it("hermes threads HIVEMIND_HERMES_PROVIDER and HIVEMIND_HERMES_MODEL into the spawn config", () => {
+    process.env.HIVEMIND_HERMES_PROVIDER = "anthropic";
+    process.env.HIVEMIND_HERMES_MODEL = "claude-opus-4-8";
+    const { bundleDir } = plantBundle(".claude-plugin");
+    spawnHermesWikiWorker({
+      config: fakeConfig(),
+      sessionId: "s-her-env",
+      cwd: "/work/x",
+      bundleDir,
+      reason: "TestSpawn",
+    });
+    const cfg = readSpawnedConfig();
+    expect(cfg.hermesProvider).toBe("anthropic");
+    expect(cfg.hermesModel).toBe("claude-opus-4-8");
   });
 });

@@ -14,14 +14,17 @@
  */
 
 import { readStdin } from "../../utils/stdin.js";
-import { loadConfig } from "../../config.js";
+import { resolveCaptureConfig } from "../shared/dir-gate.js";
+import { redactSecrets } from "../shared/redact.js";
 import { DeeplakeApi } from "../../deeplake-api.js";
-import { sqlStr } from "../../utils/sql.js";
+import { projectNameFromCwd } from "../../utils/project-name.js";
 import { log as _log } from "../../utils/debug.js";
 import { buildSessionPath } from "../../utils/session-path.js";
 import { EmbedClient } from "../../embeddings/client.js";
 import { embeddingSqlLiteral } from "../../embeddings/sql.js";
 import { embeddingsDisabled } from "../../embeddings/disable.js";
+import { buildDirectSessionInsertSql } from "../shared/session-insert-sql.js";
+import { ensurePluginNodeModulesLink } from "../../embeddings/self-heal.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
@@ -29,12 +32,15 @@ import {
   loadTriggerConfig,
   shouldTrigger,
   tryAcquireLock,
+  markSummaryAttempt,
   releaseLock,
 } from "../summary-state.js";
 import { bundleDirFromImportMeta, spawnCursorWikiWorker, wikiLog } from "./spawn-wiki-worker.js";
+import { appendSessionEvent } from "../session-event-cache.js";
 import { tryStopCounterTrigger } from "../../skillify/triggers.js";
 import type { Config } from "../../config.js";
 import { getInstalledVersion } from "../../utils/version-check.js";
+import { isHivemindPluginEnabled } from "../../utils/plugin-state.js";
 const log = (msg: string) => _log("cursor-capture", msg);
 
 function resolveEmbedDaemonPath(): string {
@@ -43,6 +49,14 @@ function resolveEmbedDaemonPath(): string {
 
 const __bundleDir = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_VERSION = getInstalledVersion(__bundleDir, ".claude-plugin") ?? "";
+
+// Self-heal the shared-deps symlink for this plugin version. Marketplace
+// auto-upgrades drop new versioned cache dirs without the symlink that
+// `hivemind embeddings install` originally created; this restores it on
+// first capture after each upgrade.
+if (!embeddingsDisabled()) {
+  try { ensurePluginNodeModulesLink({ bundleDir: __bundleDir }); } catch { /* best-effort */ }
+}
 
 interface CursorCaptureInput {
   conversation_id?: string;
@@ -77,9 +91,10 @@ function resolveCwd(input: CursorCaptureInput): string {
 
 async function main(): Promise<void> {
   if (!CAPTURE) return;
+  if (!isHivemindPluginEnabled()) { log("plugin disabled, skipping capture"); return; }
   const input = await readStdin<CursorCaptureInput>();
-  const config = loadConfig();
-  if (!config) { log("no config"); return; }
+  const config = resolveCaptureConfig(resolveCwd(input), log);
+  if (!config) return;
 
   const sessionId = input.conversation_id ?? `cursor-${Date.now()}`;
   const event = input.hook_event_name ?? "";
@@ -133,10 +148,10 @@ async function main(): Promise<void> {
   }
 
   const sessionPath = buildSessionPath(config, sessionId);
-  const line = JSON.stringify(entry);
+  const line = redactSecrets(JSON.stringify(entry));
   log(`writing to ${sessionPath}`);
 
-  const projectName = cwd.split("/").pop() || "unknown";
+  const projectName = projectNameFromCwd(cwd);
   const filename = sessionPath.split("/").pop() ?? "";
   // For JSONB: only escape single quotes, keep JSON structure intact.
   // sqlStr() would also escape backslashes and corrupt the JSON.
@@ -149,10 +164,22 @@ async function main(): Promise<void> {
     : await new EmbedClient({ daemonEntry: resolveEmbedDaemonPath() }).embed(line, "document");
   const embeddingSql = embeddingSqlLiteral(embedding);
 
-  const insertSql =
-    `INSERT INTO "${sessionsTable}" (id, path, filename, message, message_embedding, author, size_bytes, project, description, agent, plugin_version, creation_date, last_update_date) ` +
-    `VALUES ('${crypto.randomUUID()}', '${sqlStr(sessionPath)}', '${sqlStr(filename)}', '${jsonForSql}'::jsonb, ${embeddingSql}, '${sqlStr(config.userName)}', ` +
-    `${Buffer.byteLength(line, "utf-8")}, '${sqlStr(projectName)}', '${sqlStr(event)}', 'cursor', '${sqlStr(PLUGIN_VERSION)}', '${ts}', '${ts}')`;
+  const insertSql = buildDirectSessionInsertSql(sessionsTable, {
+    // Reuse the event id already embedded in the message JSON so the row PK
+    // matches the payload's id (and keeps the dedup key = the logical event).
+    id: entry.id as string,
+    sessionPath,
+    filename,
+    jsonForSql,
+    embeddingSql,
+    userName: config.userName,
+    sizeBytes: Buffer.byteLength(line, "utf-8"),
+    projectName,
+    description: event,
+    agent: "cursor",
+    pluginVersion: PLUGIN_VERSION,
+    timestamp: ts,
+  });
 
   try {
     await api.query(insertSql);
@@ -167,6 +194,12 @@ async function main(): Promise<void> {
   }
 
   log("capture ok → cloud");
+
+  // Mirror the event into the local per-session cache (row-for-row identical
+  // to the `message` column just INSERTed) so the wiki-worker reads it instead
+  // of re-scanning the fat `message` column. Best-effort; only after a
+  // successful INSERT above.
+  appendSessionEvent(sessionId, line);
 
   maybeTriggerPeriodicSummary(sessionId, cwd, config);
 
@@ -199,6 +232,12 @@ function maybeTriggerPeriodicSummary(sessionId: string, cwd: string, config: Con
     }
     wikiLog(`Periodic: threshold hit (total=${state.totalCount}, since=${state.totalCount - state.lastSummaryCount}, N=${cfg.everyNMessages}, hours=${cfg.everyHours})`);
     try {
+      // Stamp the attempt BEFORE spawning: a run that fails never reaches
+      // finalizeSummary, and without this the trigger would refire on the
+      // very next captured event (issue #331). Inside the try so a failed
+      // state write releases the lock instead of leaking it until the
+      // 10-minute stale reclaim.
+      markSummaryAttempt(sessionId);
       spawnCursorWikiWorker({
         config,
         sessionId,

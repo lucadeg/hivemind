@@ -23,6 +23,8 @@ const localManifestMock = vi.fn();
 vi.mock("../../src/utils/stdin.js", () => ({ readStdin: (...a: any[]) => stdinMock(...a) }));
 vi.mock("../../src/commands/auth.js", () => ({
   loadCredentials: (...a: any[]) => loadCredsMock(...a),
+  healDriftedOrgToken: async (creds: unknown) => creds,
+  resolveWorkspaceOverride: async (creds: unknown) => ({ creds }),
 }));
 vi.mock("../../src/utils/debug.js", () => ({
   log: (_t: string, msg: string) => debugLogMock(msg),
@@ -40,6 +42,15 @@ vi.mock("../../src/skillify/local-manifest.js", async (importOriginal) => {
     countLocalManifestEntries: (...a: any[]) => localManifestMock(...a),
   };
 });
+// The notifications drain does its own network IO (org stats, backend pushes,
+// goals). These cases are about the hook's OWN output shape, so the drain is
+// stubbed to deliver nothing. Its merge into this hook's single JSON object is
+// covered by tests/codex/codex-notifications-merge.test.ts.
+vi.mock("../../src/notifications/index.js", () => ({
+  drainSessionStart: async () => undefined,
+  registerRule: () => undefined,
+}));
+vi.mock("../../src/notifications/state.js", () => ({ bumpSessionCount: () => 1 }));
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   return { ...actual, spawn: (...a: any[]) => spawnMock(...a) };
@@ -67,7 +78,12 @@ async function runHook(env: Record<string, string | undefined> = {}): Promise<st
   console.log = (...args: any[]) => { collected.push(args.join(" ")); };
   try {
     await import("../../src/hooks/codex/session-start.js");
-    await new Promise(r => setImmediate(r));
+    // The hook is async past several awaits; poll until it writes (or gives
+    // up) rather than assuming a fixed number of microtask turns — a fixed
+    // wait silently leaks one test's output into the next test's capture.
+    for (let i = 0; i < 200 && collected.length === 0; i++) {
+      await new Promise(r => setTimeout(r, 5));
+    }
     return collected.join("\n") || null;
   } finally {
     console.log = originalLog;
@@ -100,7 +116,17 @@ describe("codex session-start hook — guards", () => {
   it("emits not-logged-in context when creds are missing (no token)", async () => {
     loadCredsMock.mockReturnValue(null);
     const out = await runHook();
-    expect(spawnMock).not.toHaveBeenCalled();
+    // The setup worker now spawns UNCONDITIONALLY (it provisions graph-deps
+    // before its own creds gate). But the graph-pull-worker stays creds-gated,
+    // so exactly one spawn (session-start-setup.js) fires here.
+    const setupCall = spawnMock.mock.calls.find(
+      ([_cmd, args]) => Array.isArray(args) && args[0]?.includes?.("session-start-setup.js"),
+    );
+    expect(setupCall).toBeDefined();
+    const pullCall = spawnMock.mock.calls.find(
+      ([_cmd, args]) => Array.isArray(args) && args[0]?.includes?.("graph-pull-worker"),
+    );
+    expect(pullCall).toBeUndefined();
     // Codex hook now emits JSON, not plain text. Parse + assert on
     // additionalContext (single-line status). See AGENT_CHANNELS.md → Codex
     // for why we kept this minimal.
@@ -119,6 +145,20 @@ describe("codex session-start hook — guards", () => {
     const parsed = JSON.parse(out!.trim());
     expect(parsed.hookSpecificOutput.additionalContext).toContain("Hivemind: logged in as org acme");
     expect(parsed.hookSpecificOutput.additionalContext).toContain("workspace: default");
+  });
+
+  it("keeps additionalContext minimal — login line only, no rules/goals block (that lives in AGENTS.md)", async () => {
+    const out = await runHook();
+    const parsed = JSON.parse(out!.trim());
+    const ctx = parsed.hookSpecificOutput.additionalContext;
+    // Codex has no model-only channel: additionalContext is user-visible, so
+    // the proactive memory instruction lives in the silent ~/.codex/AGENTS.md
+    // block (install-codex.ts), not here. Assert the EXACT logged-in context
+    // (login line + optional version notice) so any leaked block — or extra
+    // line that would clobber the TUI — fails the test.
+    expect(ctx).toMatch(
+      /^Hivemind: logged in as org acme \(workspace: default\)\.(\nHivemind v.+)?$/,
+    );
   });
 
   it("falls back to orgId when orgName is missing", async () => {
@@ -149,8 +189,14 @@ describe("codex session-start hook — spawn async setup", () => {
     const fake = makeFakeChild();
     spawnMock.mockReturnValue(fake);
     await runHook();
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-    const [cmd, args, opts] = spawnMock.mock.calls[0];
+    // Two spawns now: (a) session-start-setup.js, (b) graph-pull-worker
+    // (gated on creds — which the default fixture provides). Find the
+    // setup-spawn by argv pattern instead of asserting a strict count.
+    const setupCall = spawnMock.mock.calls.find(
+      ([_cmd, args]) => Array.isArray(args) && args[0]?.includes?.("session-start-setup.js"),
+    );
+    expect(setupCall).toBeDefined();
+    const [cmd, args, opts] = setupCall!;
     expect(cmd).toBe("node");
     expect(args[0]).toContain("session-start-setup.js");
     expect(opts.detached).toBe(true);
@@ -160,10 +206,22 @@ describe("codex session-start hook — spawn async setup", () => {
     expect(debugLogMock).toHaveBeenCalledWith("spawned async setup process");
   });
 
-  it("does not spawn when creds are missing", async () => {
+  it("spawns the setup worker even when creds are missing (graph-deps is login-independent)", async () => {
     loadCredsMock.mockReturnValue({ token: "" });
+    const fake = makeFakeChild();
+    spawnMock.mockReturnValue(fake);
     await runHook();
-    expect(spawnMock).not.toHaveBeenCalled();
+    // session-start-setup.js MUST spawn (it provisions graph-deps before its
+    // own creds gate). The graph-pull-worker MUST NOT (still creds-gated).
+    const setupCall = spawnMock.mock.calls.find(
+      ([_cmd, args]) => Array.isArray(args) && args[0]?.includes?.("session-start-setup.js"),
+    );
+    expect(setupCall).toBeDefined();
+    expect(debugLogMock).toHaveBeenCalledWith("spawned async setup process");
+    const pullCall = spawnMock.mock.calls.find(
+      ([_cmd, args]) => Array.isArray(args) && args[0]?.includes?.("graph-pull-worker"),
+    );
+    expect(pullCall).toBeUndefined();
   });
 
   it("logs 'triggered (background)' on the auto-mine path when creds are missing and worker actually fires", async () => {

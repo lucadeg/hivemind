@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, rmSync, existsSync, writeFileSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, rmSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync, symlinkSync, mkdtempSync } from "node:fs";
+import { join, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
 
 import {
@@ -8,6 +8,8 @@ import {
   pkgRoot,
   ensureDir,
   copyDir,
+  syncDir,
+  pruneDir,
   symlinkForce,
   isLink,
   readJson,
@@ -18,7 +20,10 @@ import {
   allPlatformIds,
   log,
   warn,
+  confirm,
+  promptLine,
 } from "../../src/cli/util.js";
+import { Readable } from "node:stream";
 
 /**
  * Tests for src/cli/util.ts — the shared filesystem + platform-detection
@@ -38,7 +43,7 @@ describe("HOME", () => {
 describe("pkgRoot", () => {
   it("returns an absolute path that contains a package.json", () => {
     const root = pkgRoot();
-    expect(root).toMatch(/^\//);
+    expect(isAbsolute(root)).toBe(true);
     // The package.json at pkgRoot's parent or pkgRoot itself describes the
     // hivemind package — installers read it via getVersion().
     expect(existsSync(join(root, "package.json")) || existsSync(join(root, "..", "package.json"))).toBe(true);
@@ -116,6 +121,101 @@ describe("copyDir", () => {
     writeFileSync(join(dst, "a.js"), "stale");
     copyDir(src, dst);
     expect(readFileSync(join(dst, "a.js"), "utf-8")).toBe("console.log('a')");
+  });
+});
+
+describe("syncDir / pruneDir", () => {
+  let root: string;
+  let src: string;
+  let dst: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hm-sync-"));
+    src = join(root, "src");
+    dst = join(root, "dst");
+    mkdirSync(join(src, "graph-chunks"), { recursive: true });
+    writeFileSync(join(src, "capture.js"), "new capture");
+    writeFileSync(join(src, "graph-chunks", "graph-NEW.js"), "new chunk");
+    // A previous install: same layout plus files the new payload no longer ships.
+    mkdirSync(join(dst, "graph-chunks"), { recursive: true });
+    mkdirSync(join(dst, "dropped-dir"), { recursive: true });
+    writeFileSync(join(dst, "capture.js"), "old capture");
+    writeFileSync(join(dst, "skilify-worker.js"), "renamed away");
+    writeFileSync(join(dst, "graph-chunks", "graph-OLD.js"), "stale chunk");
+    writeFileSync(join(dst, "dropped-dir", "x.md"), "stale");
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it("copies the payload and removes files and dirs the payload no longer ships, recursively", () => {
+    const removed = syncDir(src, dst);
+    expect(readFileSync(join(dst, "capture.js"), "utf-8")).toBe("new capture");
+    expect(existsSync(join(dst, "graph-chunks", "graph-NEW.js"))).toBe(true);
+    expect(existsSync(join(dst, "skilify-worker.js"))).toBe(false);
+    expect(existsSync(join(dst, "graph-chunks", "graph-OLD.js"))).toBe(false);
+    expect(existsSync(join(dst, "dropped-dir"))).toBe(false);
+    expect(removed.sort()).toEqual([
+      join(dst, "dropped-dir"),
+      join(dst, "graph-chunks", "graph-OLD.js"),
+      join(dst, "skilify-worker.js"),
+    ].sort());
+  });
+
+  it("unlinks a stray symlink inside the owned dir without touching its target", () => {
+    const target = join(root, "outside");
+    mkdirSync(target);
+    writeFileSync(join(target, "keep.txt"), "user data");
+    symlinkSync(target, join(dst, "linked"));
+    syncDir(src, dst);
+    expect(isLink(join(dst, "linked"))).toBe(false);
+    expect(existsSync(join(dst, "linked"))).toBe(false);
+    expect(readFileSync(join(target, "keep.txt"), "utf-8")).toBe("user data");
+  });
+
+  it("replaces a symlink sitting at a shipped name instead of writing through it", () => {
+    const outside = join(root, "outside-file");
+    writeFileSync(outside, "user data");
+    const outsideDir = join(root, "outside-dir");
+    mkdirSync(outsideDir);
+    rmSync(join(dst, "capture.js"));
+    symlinkSync(outside, join(dst, "capture.js"));
+    rmSync(join(dst, "graph-chunks"), { recursive: true });
+    symlinkSync(outsideDir, join(dst, "graph-chunks"));
+    syncDir(src, dst);
+    expect(isLink(join(dst, "capture.js"))).toBe(false);
+    expect(readFileSync(join(dst, "capture.js"), "utf-8")).toBe("new capture");
+    expect(readFileSync(outside, "utf-8")).toBe("user data");
+    expect(isLink(join(dst, "graph-chunks"))).toBe(false);
+    expect(existsSync(join(dst, "graph-chunks", "graph-NEW.js"))).toBe(true);
+    expect(readdirSync(outsideDir)).toEqual([]);
+  });
+
+  it("refuses to sync into a destination that is itself a symlink", () => {
+    const linked = join(root, "linked-dst");
+    symlinkSync(dst, linked);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    expect(syncDir(src, linked)).toEqual([]);
+    expect(existsSync(join(dst, "skilify-worker.js"))).toBe(true);
+  });
+
+  it("replaces a file with a directory and a directory with a file when the payload changed kind", () => {
+    mkdirSync(join(src, "was-file"));
+    writeFileSync(join(src, "was-file", "inner.js"), "now a dir");
+    writeFileSync(join(src, "was-dir"), "now a file");
+    writeFileSync(join(dst, "was-file"), "old file");
+    mkdirSync(join(dst, "was-dir"));
+    writeFileSync(join(dst, "was-dir", "old.js"), "old dir content");
+    syncDir(src, dst);
+    expect(readFileSync(join(dst, "was-file", "inner.js"), "utf-8")).toBe("now a dir");
+    expect(readFileSync(join(dst, "was-dir"), "utf-8")).toBe("now a file");
+  });
+
+  it("pruneDir keeps only the named entries and is a no-op on a missing dir", () => {
+    const removed = pruneDir(dst, ["capture.js", "graph-chunks"]);
+    expect(removed.sort()).toEqual([join(dst, "dropped-dir"), join(dst, "skilify-worker.js")].sort());
+    expect(existsSync(join(dst, "graph-chunks", "graph-OLD.js"))).toBe(true);
+    expect(pruneDir(join(root, "nope"), [])).toEqual([]);
   });
 });
 
@@ -205,8 +305,8 @@ describe("readVersionStamp / writeVersionStamp", () => {
 });
 
 describe("detectPlatforms / allPlatformIds", () => {
-  it("allPlatformIds returns the canonical six-platform set", () => {
-    expect(allPlatformIds()).toEqual(["claude", "codex", "claw", "cursor", "hermes", "pi"]);
+  it("allPlatformIds returns the canonical platform set", () => {
+    expect(allPlatformIds()).toEqual(["claude", "codex", "claw", "cursor", "hermes", "pi", "claude_cowork"]);
   });
 
   it("detectPlatforms returns only platforms whose marker dir exists right now", () => {
@@ -254,5 +354,86 @@ describe("log / warn", () => {
     expect(stderrSpy).toHaveBeenCalledTimes(1);
     expect(stderrSpy).toHaveBeenCalledWith("oops\n");
     expect(stdoutSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("confirm", () => {
+  let stdinBackup: NodeJS.ReadStream;
+
+  beforeEach(() => {
+    stdinBackup = process.stdin;
+    // Silence the rendered question to keep test output clean.
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, "stdin", { value: stdinBackup, configurable: true });
+    vi.restoreAllMocks();
+  });
+
+  function stubStdin(input: string): void {
+    const stream = Readable.from([input]) as unknown as NodeJS.ReadStream;
+    Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+  }
+
+  it("returns defaultYes=true on bare Enter (empty line)", async () => {
+    stubStdin("\n");
+    expect(await confirm("?", true)).toBe(true);
+  });
+
+  it("returns defaultYes=false on bare Enter when default is no", async () => {
+    stubStdin("\n");
+    expect(await confirm("?", false)).toBe(false);
+  });
+
+  it("'y' / 'yes' both resolve true (case-insensitive)", async () => {
+    stubStdin("y\n");
+    expect(await confirm("?", false)).toBe(true);
+    stubStdin("YES\n");
+    expect(await confirm("?", false)).toBe(true);
+  });
+
+  it("'n' resolves false even when defaultYes is true", async () => {
+    stubStdin("n\n");
+    expect(await confirm("?", true)).toBe(false);
+  });
+
+  it("any other input resolves false (conservative default)", async () => {
+    stubStdin("maybe\n");
+    expect(await confirm("?", true)).toBe(false);
+  });
+});
+
+describe("promptLine", () => {
+  let stdinBackup: NodeJS.ReadStream;
+
+  beforeEach(() => {
+    stdinBackup = process.stdin;
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, "stdin", { value: stdinBackup, configurable: true });
+    vi.restoreAllMocks();
+  });
+
+  function stubStdin(input: string): void {
+    const stream = Readable.from([input]) as unknown as NodeJS.ReadStream;
+    Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+  }
+
+  it("returns the trimmed input line", async () => {
+    stubStdin("  hello-token  \n");
+    expect(await promptLine("API key: ")).toBe("hello-token");
+  });
+
+  it("returns empty string on a bare Enter (signal to skip)", async () => {
+    stubStdin("\n");
+    expect(await promptLine("API key: ")).toBe("");
+  });
+
+  it("preserves internal whitespace in pasted tokens", async () => {
+    stubStdin("tok with spaces\n");
+    expect(await promptLine("API key: ")).toBe("tok with spaces");
   });
 });

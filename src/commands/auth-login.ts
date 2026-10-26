@@ -21,10 +21,12 @@
 
 import {
   login, loadCredentials, saveCredentials, deleteCredentials, listOrgs, switchOrg,
-  listWorkspaces, switchWorkspace,
+  listWorkspaces, switchWorkspace, findWorkspace,
   inviteMember, listMembers, removeMember,
 } from "./auth.js";
 import { sessionPrune } from "./session-prune.js";
+import { loadConfig } from "../config.js";
+import { renderWhoami } from "./whoami.js";
 
 /**
  * Dispatch one auth subcommand.
@@ -47,10 +49,12 @@ export async function runAuthCommand(args: string[]): Promise<void> {
     }
 
     case "whoami": {
-      if (!creds) { console.log("Not logged in. Run: node auth-login.js login"); break; }
-      console.log(`User org: ${creds.orgName ?? creds.orgId}`);
-      console.log(`Workspace: ${creds.workspaceId ?? "default"}`);
-      console.log(`API: ${creds.apiUrl ?? "https://api.deeplake.ai"}`);
+      if (!creds) { console.log("Not logged in. Run: hivemind login"); break; }
+      // Report the EFFECTIVE identity for the cwd, not the raw stored creds:
+      // env vars and a per-directory `.hivemind` both override them, and this
+      // is the surface users (and agents) ask "what am I connected to?".
+      // Reading creds directly here made `whoami` misreport under either.
+      console.log(renderWhoami(loadConfig(), creds, process.cwd()));
       break;
     }
 
@@ -72,13 +76,12 @@ export async function runAuthCommand(args: string[]): Promise<void> {
         // org switch never happens — re-running the command then succeeds
         // cleanly instead of leaving credentials half-committed.
         const prevWs = creds.workspaceId ?? "default";
-        const lcPrev = prevWs.toLowerCase();
         const wsList = await listWorkspaces(creds.token, apiUrl, match.id);
         // Resolve to the matched workspace OBJECT, not a boolean: `workspaceId`
         // is supposed to be a canonical id but legacy creds (and the post-login
         // `"default"` sentinel) can hold a name. We need the matched object so
         // we can normalize a name-only match to the canonical id.
-        const matchedWs = wsList.find(w => w.id === prevWs || (w.name && w.name.toLowerCase() === lcPrev));
+        const matchedWs = findWorkspace(wsList, prevWs);
 
         await switchOrg(match.id, match.name);
         console.log(`Switched to org: ${match.name}`);
@@ -128,8 +131,7 @@ export async function runAuthCommand(args: string[]): Promise<void> {
         const target = args[2];
         if (!target) { console.log("Usage: workspace switch <name-or-id>"); process.exit(1); }
         const wsList = await listWorkspaces(creds.token, apiUrl, creds.orgId);
-        const lcTarget = target.toLowerCase();
-        const match = wsList.find(w => w.id === target || (w.name && w.name.toLowerCase() === lcTarget));
+        const match = findWorkspace(wsList, target);
         if (!match) {
           console.log(`Workspace not found: ${target}`);
           if (wsList.length > 0) {

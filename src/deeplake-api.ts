@@ -1,8 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { log as _log } from "./utils/debug.js";
 import { sqlStr, sqlIdent } from "./utils/sql.js";
-import { SUMMARY_EMBEDDING_COL, MESSAGE_EMBEDDING_COL } from "./embeddings/columns.js";
+import { SUMMARY_EMBEDDING_COL } from "./embeddings/columns.js";
 import { deeplakeClientHeader } from "./utils/client-header.js";
+import {
+  CODEBASE_COLUMNS,
+  MEMORY_COLUMNS,
+  SESSIONS_COLUMNS,
+  SKILLS_COLUMNS,
+  RULES_COLUMNS,
+  GOALS_COLUMNS,
+  DOCS_COLUMNS,
+  buildCreateTableSql,
+  healMissingColumns,
+} from "./deeplake-schema.js";
+import { enqueueNotification } from "./notifications/queue.js";
+import { loadCredentials } from "./commands/auth-creds.js";
 
 // index-marker-store touches node:fs. Load it lazily so bundlers that split
 // chunks (e.g. the openclaw plugin build) can put fs operations in a separate
@@ -35,16 +48,151 @@ function traceSql(msg: string): void {
   if (process.env.HIVEMIND_DEBUG === "1") log(msg);
 }
 
+// Process-local flag so the balance-exhausted notification is enqueued at
+// most once per process. Cross-process dedup (so dozens of concurrent hook
+// processes don't pile up duplicate queue entries) is handled by
+// queue.ts's sameDedupKey check.
+let _signalledBalanceExhausted = false;
+
+// NOTE: the "approaching empty" (low-balance, balance > 0) warning is no
+// longer detected here. It's surfaced LIVE at SessionStart from the
+// `X-Activeloop-Balance-Cents` header on the org-stats call — see
+// notifications/sources/{org-stats,primary-banner}.ts. Detecting it on the
+// query path made it lag a session (it landed in the queue, read at the
+// NEXT SessionStart) and could double with the live banner. Hard exhaustion
+// (402) still flows through maybeSignalBalanceExhausted below.
+
+/**
+ * If the response is the server's "out of credits" 402
+ * (`{"balance_cents":0,"error":"insufficient balance, please top up"}`),
+ * enqueue a session-start banner so the user actually finds out. Without
+ * this, captures and memory recalls fail silently — the agent reads empty
+ * memory and confidently reasons from no data, never telling the user
+ * why. See logs at ~/.deeplake/hook-debug.log when HIVEMIND_DEBUG=1.
+ *
+ * Fire-and-forget — the caller's existing throw path is unchanged so any
+ * upstream `try/catch` keeps working. Process-local dedup prevents
+ * re-enqueueing on every retry within the same hook process.
+ *
+ * DedupKey carries the UTC date so the banner re-fires daily until the
+ * user tops up, rather than firing once-ever and then going quiet.
+ */
+/**
+ * Turn a thrown fetch error into something a human can act on.
+ *
+ * `fetch` rejects with a bare `TypeError: fetch failed` for every transport
+ * failure — the real cause is buried in `.cause`. Surfacing the bare message
+ * is how `hivemind goal list` came to print `hivemind goal list: fetch failed`,
+ * which tells the user nothing about what to do.
+ *
+ * The common case is not a broken network: it is an agent sandbox with
+ * outbound access disabled. Verified 2026-08-13 — the same command, same org,
+ * same server, run under Codex's default `workspace-write` sandbox prints
+ * `fetch failed`, and under `danger-full-access` returns normally. Name that
+ * possibility rather than making the user discover it.
+ */
+export function describeNetworkFailure(e: unknown, apiUrl: string): Error {
+  const cause = (e as { cause?: { code?: string; message?: string } } | null)?.cause;
+  const detail = cause?.code ?? cause?.message
+    ?? (e instanceof Error ? e.message : String(e));
+  return new Error(
+    `Cannot reach the Deeplake API at ${apiUrl} (${detail}). `
+    + `If you are running inside an agent sandbox, outbound network access may be blocked — `
+    + `Codex's default sandbox blocks it, so run the command in your own terminal instead.`,
+  );
+}
+
+/**
+ * The server's "out of credits" response: HTTP 402 whose body carries
+ * `balance_cents`. Single source of truth for both the session-start banner
+ * and the human-readable error message thrown to CLI callers.
+ */
+export function isBalanceExhausted(status: number, bodyText: string): boolean {
+  return status === 402 && bodyText.includes("balance_cents");
+}
+
+function maybeSignalBalanceExhausted(status: number, bodyText: string): void {
+  if (!isBalanceExhausted(status, bodyText)) return;
+  if (_signalledBalanceExhausted) return;
+  _signalledBalanceExhausted = true;
+  log(`balance exhausted — enqueuing session-start banner (body=${bodyText.slice(0, 120)})`);
+  // transient: true → the drain shows it but doesn't record in state.shown.
+  // The enqueue path is itself the rate limit: only fires on a real 402,
+  // so once balance is restored no fresh enqueue happens and the banner
+  // silences naturally. dedupKey is stable so concurrent hook processes
+  // within one session collapse to one queue entry.
+  enqueueNotification({
+    id: "balance-exhausted",
+    severity: "warn",
+    transient: true,
+    title: "Hivemind credits exhausted — top up to keep capturing",
+    body: `Sessions are not being saved and memory recall is returning empty. Top up at ${billingUrl()} to restore capture and recall.`,
+    // Carries the org so a notice enqueued under one org is never rendered
+    // after switching to another (observed: switching to a funded org still
+    // showed the previous org's "credits exhausted" and linked to ITS billing
+    // page). drainSessionStart drops queued notices whose org no longer
+    // matches the credentials in force.
+    dedupKey: { reason: "balance-zero", orgId: loadCredentials()?.orgId ?? null },
+    // User-facing billing notice → user channel only. Never the model's
+    // additionalContext: a "top up at <url>" instruction in the agent prompt
+    // is a prompt-injection pattern external agents flag.
+    userVisibleOnly: true,
+  }).catch((e: unknown) => {
+    log(`enqueue balance-exhausted failed: ${e instanceof Error ? e.message : String(e)}`);
+  });
+}
+
+/**
+ * Construct the org-scoped billing URL from persisted credentials:
+ * `https://deeplake.ai/{orgId}/workspace/{workspaceId}/billing`.
+ *
+ * Keyed on the org ID, NOT `orgName`. `orgName` is a human display name, not a
+ * slug — the API returns e.g. `"mvincig11's Organization"`, which rendered as
+ * `deeplake.ai/mvincig11's%20Organization/workspace/default/billing`: an
+ * apostrophe and an escaped space in a path segment. A dead link at the exact
+ * moment the user needs to top up defeats the purpose of the notice. The API
+ * exposes no slug field (checked `/organizations/{id}` — it returns only `id`
+ * and the display `name`), so the UUID is the one unambiguous, URL-safe
+ * identifier available.
+ *
+ * Falls back to the bare host when creds are missing or malformed — better to
+ * point at *something* than at a URL with literal `undefined` segments.
+ */
+function billingUrl(): string {
+  try {
+    const c = loadCredentials();
+    if (c?.orgId && c?.workspaceId) {
+      return `https://deeplake.ai/${encodeURIComponent(c.orgId)}/workspace/${encodeURIComponent(c.workspaceId)}/billing`;
+    }
+  } catch { /* fall through to default */ }
+  return "https://deeplake.ai";
+}
+
 // ── Retry & concurrency primitives ──────────────────────────────────────────
 
 const RETRYABLE_CODES = new Set([429, 500, 502, 503, 504]);
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 500;
 const MAX_CONCURRENCY = 5;
-const QUERY_TIMEOUT_MS = Number(process.env.HIVEMIND_QUERY_TIMEOUT_MS ?? 10_000);
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// Lazy read: the openclaw bundle replaces `process.env.HIVEMIND_QUERY_TIMEOUT_MS`
+// with a `globalThis.__hivemind_tuning__?.HIVEMIND_QUERY_TIMEOUT_MS` lookup via
+// esbuild `define`. The lookup must happen at call-time (not module-init) so
+// it picks up the value openclaw populates AFTER this module is imported.
+// Was previously `const QUERY_TIMEOUT_MS = …` at module top — that would have
+// frozen the value to 10000 for the openclaw bundle regardless of pluginConfig.
+function getQueryTimeoutMs(): number {
+  return Number(process.env.HIVEMIND_QUERY_TIMEOUT_MS ?? 10_000);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error("aborted"));
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    // An abort during the backoff short-circuits the wait (and clears the
+    // timer) so a caller's deadline isn't kept alive by the retry sleep.
+    signal?.addEventListener("abort", () => { clearTimeout(t); reject(new Error("aborted")); }, { once: true });
+  });
 }
 
 function isTimeoutError(error: unknown): boolean {
@@ -120,13 +268,13 @@ export class DeeplakeApi {
   ) {}
 
   /** Execute SQL with retry on transient errors and bounded concurrency. */
-  async query(sql: string): Promise<Record<string, unknown>[]> {
+  async query(sql: string, signal?: AbortSignal): Promise<Record<string, unknown>[]> {
     const startedAt = Date.now();
     const summary = summarizeSql(sql);
     traceSql(`query start: ${summary}`);
     await this._sem.acquire();
     try {
-      const rows = await this._queryWithRetry(sql);
+      const rows = await this._queryWithRetry(sql, signal);
       traceSql(`query ok (${Date.now() - startedAt}ms, rows=${rows.length}): ${summary}`);
       return rows;
     } catch (e: unknown) {
@@ -138,12 +286,21 @@ export class DeeplakeApi {
     }
   }
 
-  private async _queryWithRetry(sql: string): Promise<Record<string, unknown>[]> {
+  private async _queryWithRetry(sql: string, externalSignal?: AbortSignal): Promise<Record<string, unknown>[]> {
     let lastError: Error | undefined;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      // A caller-supplied signal (e.g. a hook's latency budget) aborts the
+      // whole operation — including between retries — so in-flight work is
+      // actually cancelled, not just abandoned.
+      if (externalSignal?.aborted) throw new Error("Query aborted");
       let resp: Response;
+      const timeoutMs = getQueryTimeoutMs();
       try {
-        const signal = AbortSignal.timeout(QUERY_TIMEOUT_MS);
+        // Cancel on whichever fires first: the caller's signal or our own
+        // per-attempt fetch timeout.
+        const signal = externalSignal
+          ? AbortSignal.any([externalSignal, AbortSignal.timeout(timeoutMs)])
+          : AbortSignal.timeout(timeoutMs);
         resp = await fetch(`${this.apiUrl}/workspaces/${this.workspaceId}/tables/query`, {
           method: "POST",
           headers: {
@@ -158,14 +315,14 @@ export class DeeplakeApi {
       } catch (e: unknown) {
         // Network-level failure (DNS, TCP reset, timeout, etc.)
         if (isTimeoutError(e)) {
-          lastError = new Error(`Query timeout after ${QUERY_TIMEOUT_MS}ms`);
+          lastError = new Error(`Query timeout after ${timeoutMs}ms`);
           throw lastError;
         }
-        lastError = e instanceof Error ? e : new Error(String(e));
+        lastError = describeNetworkFailure(e, this.apiUrl);
         if (attempt < MAX_RETRIES) {
           const delay = BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 200;
           log(`query retry ${attempt + 1}/${MAX_RETRIES} (fetch error: ${lastError.message}) in ${delay.toFixed(0)}ms`);
-          await sleep(delay);
+          await sleep(delay, externalSignal);
           continue;
         }
         throw lastError;
@@ -189,8 +346,23 @@ export class DeeplakeApi {
       if (!alreadyExists && attempt < MAX_RETRIES && (RETRYABLE_CODES.has(resp.status) || retryable403)) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 200;
         log(`query retry ${attempt + 1}/${MAX_RETRIES} (${resp.status}) in ${delay.toFixed(0)}ms`);
-        await sleep(delay);
+        await sleep(delay, externalSignal);
         continue;
+      }
+      // Surface a session-start banner for the "out of credits" case before
+      // throwing — see maybeSignalBalanceExhausted's docstring for why.
+      maybeSignalBalanceExhausted(resp.status, text);
+      // The out-of-credits 402 is the one server error a user can act on, and
+      // it is the one they are most likely to read raw: `hivemind goal list`
+      // and friends print this message straight to the terminal. Emitting the
+      // API's JSON body verbatim ("Query failed: 402: {"balance_cents":0,...}")
+      // made it look like an internal fault rather than "your account is out
+      // of credits" — reported 2026-08-12 in #platform. Every other status
+      // keeps the raw shape, which is what the debugging paths expect.
+      if (isBalanceExhausted(resp.status, text)) {
+        throw new Error(
+          `Hivemind credits exhausted — sessions are not being saved and memory recall returns empty. Top up at ${billingUrl()} to restore capture and recall.`,
+        );
       }
       throw new Error(`Query failed: ${resp.status}: ${text.slice(0, 200)}`);
     }
@@ -285,74 +457,33 @@ export class DeeplakeApi {
   }
 
   /**
-   * Ensure a vector column exists on the given table.
+   * Heal any missing columns on a table so it matches one of the schema
+   * definitions in `deeplake-schema.ts`. One SELECT against
+   * `information_schema.columns` per call, then `ALTER TABLE ADD COLUMN`
+   * only the genuinely missing ones — never blanket, never `IF NOT
+   * EXISTS`.
    *
-   * The previous implementation always issued `ALTER TABLE ADD COLUMN IF NOT
-   * EXISTS …` on every SessionStart. On a long-running workspace that's
-   * already migrated, every call returns 500 "Column already exists" — noisy
-   * in the log and a wasted round-trip. Worse, the very first call after the
-   * column is genuinely added triggers Deeplake's post-ALTER `vector::at`
-   * window (~30s) during which subsequent INSERTs fail; minimising the
-   * number of ALTER calls minimises exposure to that window.
-   *
-   * New flow:
-   *   1. Check the local marker file (mirrors ensureLookupIndex). If fresh,
-   *      return — zero network calls.
-   *   2. SELECT 1 FROM information_schema.columns WHERE table_name = T AND
-   *      column_name = C. Read-only, idempotent, can't tickle the post-ALTER
-   *      bug. If the column is present → mark + return.
-   *   3. Only if step 2 says the column is missing, fall back to ALTER ADD
-   *      COLUMN IF NOT EXISTS. Mark on success, also mark if Deeplake reports
-   *      "already exists" (race: another client added it between our SELECT
-   *      and ALTER).
-   *
-   * Marker uses the same dir / TTL as ensureLookupIndex so both schema
-   * caches share an opt-out (HIVEMIND_INDEX_MARKER_DIR) and a TTL knob.
+   * History: an earlier path used a local marker file (`col_<name>` under
+   * the index-marker dir) to skip even the SELECT after the first
+   * confirmation, plus per-column ALTERs for `summary_embedding`,
+   * `message_embedding`, `agent`, `plugin_version`. The marker existed
+   * because Deeplake used to expose a ~30s post-ALTER bug where
+   * subsequent INSERTs failed, so we wanted to keep ALTER traffic to a
+   * minimum. The bug was re-verified on 2026-05-18 against
+   * `api.deeplake.ai` (`test_plugin` org) and no longer reproduces
+   * (71/71 INSERTs OK, first success 2ms after ALTER). The single SELECT
+   * + targeted ALTER pattern survives the marker removal because: each
+   * ALTER still costs ~800ms (so blanket sweeps are wasteful) and the
+   * diff produces clearer logs than "ALTER all with IF NOT EXISTS".
    */
-  private async ensureEmbeddingColumn(table: string, column: string): Promise<void> {
-    await this.ensureColumn(table, column, "FLOAT4[]");
-  }
-
-  /**
-   * Generic marker-gated column migration. Same SELECT-then-ALTER flow as
-   * ensureEmbeddingColumn, parameterized by SQL type so it can patch up any
-   * column that was added to the schema after the table was originally
-   * created. Used today for `summary_embedding`, `message_embedding`, and
-   * the `agent` column (added 2026-04-11) — the latter has no fallback if
-   * a user upgraded over a pre-2026-04-11 table, so every INSERT fails
-   * with `column "agent" does not exist`.
-   */
-  private async ensureColumn(table: string, column: string, sqlType: string): Promise<void> {
-    const markers = await getIndexMarkerStore();
-    const markerPath = markers.buildIndexMarkerPath(this.workspaceId, this.orgId, table, `col_${column}`);
-    if (markers.hasFreshIndexMarker(markerPath)) return;
-
-    // Include table_schema = workspaceId to disambiguate across tenants — Deeplake's
-    // information_schema.columns is multi-workspace, so a same-named table in another
-    // workspace that already has the column would otherwise produce a false-positive
-    // PRESENT and skip the ALTER on this workspace's actual table.
-    const colCheck = `SELECT 1 FROM information_schema.columns ` +
-      `WHERE table_name = '${sqlStr(table)}' AND column_name = '${sqlStr(column)}' AND table_schema = '${sqlStr(this.workspaceId)}' LIMIT 1`;
-
-    const rows = await this.query(colCheck);
-    if (rows.length > 0) {
-      markers.writeIndexMarker(markerPath);
-      return;
-    }
-
-    // Column confirmed missing: ALTER without IF NOT EXISTS so any failure is
-    // surfaced. The single tolerated exception is a race with another writer
-    // that adds the column between our SELECT and our ALTER — re-SELECT to
-    // confirm and treat as success. Everything else propagates.
-    try {
-      await this.query(`ALTER TABLE "${table}" ADD COLUMN ${column} ${sqlType}`);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!/already exists/i.test(msg)) throw e;
-      const recheck = await this.query(colCheck);
-      if (recheck.length === 0) throw e;
-    }
-    markers.writeIndexMarker(markerPath);
+  private async healSchema(table: string, columns: typeof MEMORY_COLUMNS): Promise<void> {
+    await healMissingColumns({
+      query: sql => this.query(sql) as Promise<unknown>,
+      tableName: table,
+      workspaceId: this.workspaceId,
+      columns,
+      log,
+    });
   }
 
   /** List all tables in the workspace (with retry). */
@@ -362,6 +493,22 @@ export class DeeplakeApi {
     const { tables, cacheable } = await this._fetchTables();
     if (cacheable) this._tablesCache = [...tables];
     return tables;
+  }
+
+  /**
+   * Like listTables() but returns null when the list could NOT be trusted
+   * (the fetch failed / was non-cacheable). Callers gating a read on table
+   * existence use this to tell a genuinely-empty workspace ([]) apart from a
+   * failed lookup (null): on [] they can safely skip the read (no table → no
+   * 42P01), on null they must fall back to SELECT-then-catch so a transient
+   * lookup blip doesn't drop a read of a table that really exists.
+   */
+  async knownTablesOrNull(): Promise<string[] | null> {
+    if (this._tablesCache) return [...this._tablesCache];
+    const { tables, cacheable } = await this._fetchTables();
+    if (!cacheable) return null;
+    this._tablesCache = [...tables];
+    return [...tables];
   }
 
   private async _fetchTables(): Promise<{ tables: string[]; cacheable: boolean }> {
@@ -426,58 +573,35 @@ export class DeeplakeApi {
     throw lastErr;
   }
 
-  /** Create the memory table if it doesn't already exist. Migrate columns on existing tables. */
+  /** Create the memory table if it doesn't already exist. Heal missing columns on existing tables. */
   async ensureTable(name?: string): Promise<void> {
+    // Drift guard runs *before* any SQL: ensures fresh tables can't be
+    // created with a MEMORY_COLUMNS that has drifted from
+    // SUMMARY_EMBEDDING_COL (used by the SDK on the write path).
+    if (!MEMORY_COLUMNS.some(c => c.name === SUMMARY_EMBEDDING_COL)) {
+      throw new Error(`MEMORY_COLUMNS missing "${SUMMARY_EMBEDDING_COL}" (embeddings/columns.ts drift)`);
+    }
     // sqlIdent throws on anything outside [A-Za-z_][A-Za-z0-9_]* — protects
     // against HIVEMIND_TABLE config injection (a stray quote would otherwise
     // break CREATE TABLE / ALTER COLUMN / CREATE INDEX startup, and widen the
-    // SQL-injection surface for config-driven values). Mirror of the
-    // ensureSkillsTable guard (commit c0e77b8).
+    // SQL-injection surface for config-driven values).
     const tbl = sqlIdent(name ?? this.tableName);
     const tables = await this.listTables();
     if (!tables.includes(tbl)) {
       log(`table "${tbl}" not found, creating`);
-      await this.createTableWithRetry(
-        `CREATE TABLE IF NOT EXISTS "${tbl}" (` +
-          `id TEXT NOT NULL DEFAULT '', ` +
-          `path TEXT NOT NULL DEFAULT '', ` +
-          `filename TEXT NOT NULL DEFAULT '', ` +
-          `summary TEXT NOT NULL DEFAULT '', ` +
-          `summary_embedding FLOAT4[], ` +
-          `author TEXT NOT NULL DEFAULT '', ` +
-          `mime_type TEXT NOT NULL DEFAULT 'text/plain', ` +
-          `size_bytes BIGINT NOT NULL DEFAULT 0, ` +
-          `project TEXT NOT NULL DEFAULT '', ` +
-          `description TEXT NOT NULL DEFAULT '', ` +
-          `agent TEXT NOT NULL DEFAULT '', ` +
-          `plugin_version TEXT NOT NULL DEFAULT '', ` +
-          `creation_date TEXT NOT NULL DEFAULT '', ` +
-          `last_update_date TEXT NOT NULL DEFAULT ''` +
-        `) USING deeplake`,
-        tbl,
-      );
+      await this.createTableWithRetry(buildCreateTableSql(tbl, MEMORY_COLUMNS), tbl);
       log(`table "${tbl}" created`);
       if (!tables.includes(tbl)) this._tablesCache = [...tables, tbl];
     }
-    // Always verify the embedding column is present, regardless of who created
-    // the table. CREATE TABLE may have raced with another plugin's CREATE that
-    // used an older schema without summary_embedding (e.g. a stale bundle of
-    // a sibling plugin sharing the same memory table). ensureEmbeddingColumn
-    // is idempotent and steady-state-cheap: SELECT info_schema, ALTER only if
-    // the column is genuinely missing.
-    await this.ensureEmbeddingColumn(tbl, SUMMARY_EMBEDDING_COL);
-    // Same fallback for the `agent` column (added 2026-04-11). Pre-2026-04-11
-    // tables don't have it; without this ALTER, every INSERT fails with
-    // `column "agent" does not exist` after upgrading over an old schema.
-    await this.ensureColumn(tbl, "agent", "TEXT NOT NULL DEFAULT ''");
-    await this.ensureColumn(tbl, "plugin_version", "TEXT NOT NULL DEFAULT ''");
+    // Always heal after the create/exists decision. Reason: `listTables()`
+    // is cached, so a stale cache plus a concurrent CREATE from another
+    // writer means `CREATE TABLE IF NOT EXISTS` here can silently no-op
+    // against a legacy table. Running healSchema unconditionally covers
+    // that race; on a genuinely fresh CREATE the SELECT sees the canonical
+    // column set and triggers zero ALTERs (one extra SELECT, ~250ms).
+    await this.healSchema(tbl, MEMORY_COLUMNS);
     // BM25 index disabled — CREATE INDEX causes intermittent oid errors on fresh tables.
     // See bm25-oid-bug.sh for reproduction. Re-enable once Deeplake fixes the oid invalidation.
-    // try {
-    //   await this.query(
-    //     `CREATE INDEX IF NOT EXISTS idx_${tbl}_summary_bm25 ON "${this.workspaceId}"."${tbl}" USING deeplake_index (summary) WITH (index_type = 'bm25')`
-    //   );
-    // } catch { /* index may already exist or not be supported */ }
   }
 
   /** Create the sessions table (uses JSONB for message since every row is a JSON event). */
@@ -489,33 +613,13 @@ export class DeeplakeApi {
     const tables = await this.listTables();
     if (!tables.includes(safe)) {
       log(`table "${safe}" not found, creating`);
-      await this.createTableWithRetry(
-        `CREATE TABLE IF NOT EXISTS "${safe}" (` +
-          `id TEXT NOT NULL DEFAULT '', ` +
-          `path TEXT NOT NULL DEFAULT '', ` +
-          `filename TEXT NOT NULL DEFAULT '', ` +
-          `message JSONB, ` +
-          `message_embedding FLOAT4[], ` +
-          `author TEXT NOT NULL DEFAULT '', ` +
-          `mime_type TEXT NOT NULL DEFAULT 'application/json', ` +
-          `size_bytes BIGINT NOT NULL DEFAULT 0, ` +
-          `project TEXT NOT NULL DEFAULT '', ` +
-          `description TEXT NOT NULL DEFAULT '', ` +
-          `agent TEXT NOT NULL DEFAULT '', ` +
-          `plugin_version TEXT NOT NULL DEFAULT '', ` +
-          `creation_date TEXT NOT NULL DEFAULT '', ` +
-          `last_update_date TEXT NOT NULL DEFAULT ''` +
-        `) USING deeplake`,
-        safe,
-      );
+      await this.createTableWithRetry(buildCreateTableSql(safe, SESSIONS_COLUMNS), safe);
       log(`table "${safe}" created`);
       if (!tables.includes(safe)) this._tablesCache = [...tables, safe];
     }
-    // Always verify message_embedding is present (same rationale as ensureTable).
-    await this.ensureEmbeddingColumn(safe, MESSAGE_EMBEDDING_COL);
-    // Same fallback for the `agent` column (see ensureTable for rationale).
-    await this.ensureColumn(safe, "agent", "TEXT NOT NULL DEFAULT ''");
-    await this.ensureColumn(safe, "plugin_version", "TEXT NOT NULL DEFAULT ''");
+    // Always heal — covers the stale-listTables race the same way as
+    // ensureTable. Cheap when the table was genuinely fresh.
+    await this.healSchema(safe, SESSIONS_COLUMNS);
     await this.ensureLookupIndex(safe, "path_creation_date", `("path", "creation_date")`);
   }
 
@@ -529,6 +633,29 @@ export class DeeplakeApi {
    * This sidesteps the Deeplake UPDATE-coalescing quirk that bit the wiki
    * worker.
    */
+  /**
+   * Create the codebase table. One row per (org, workspace, repo, user,
+   * worktree, commit) — see CODEBASE_COLUMNS for the schema. Healing
+   * + index follow the same pattern as ensureSessionsTable.
+   */
+  async ensureCodebaseTable(name: string): Promise<void> {
+    const safe = sqlIdent(name);
+    const tables = await this.listTables();
+    if (!tables.includes(safe)) {
+      log(`table "${safe}" not found, creating`);
+      await this.createTableWithRetry(buildCreateTableSql(safe, CODEBASE_COLUMNS), safe);
+      log(`table "${safe}" created`);
+      if (!tables.includes(safe)) this._tablesCache = [...tables, safe];
+    }
+    await this.healSchema(safe, CODEBASE_COLUMNS);
+    // Index on the identity key so SELECT-before-INSERT lookups don't full-scan.
+    await this.ensureLookupIndex(
+      safe,
+      "codebase_identity",
+      `("org_id", "workspace_id", "repo_slug", "user_id", "worktree_id", "commit_sha")`,
+    );
+  }
+
   async ensureSkillsTable(name: string): Promise<void> {
     // Validate the table identifier before any SQL interpolation.
     // `name` ultimately comes from HIVEMIND_SKILLS_TABLE — a stray quote
@@ -538,30 +665,94 @@ export class DeeplakeApi {
     const tables = await this.listTables();
     if (!tables.includes(safe)) {
       log(`table "${safe}" not found, creating`);
-      await this.createTableWithRetry(
-        `CREATE TABLE IF NOT EXISTS "${safe}" (` +
-          `id TEXT NOT NULL DEFAULT '', ` +
-          `name TEXT NOT NULL DEFAULT '', ` +
-          `project TEXT NOT NULL DEFAULT '', ` +
-          `project_key TEXT NOT NULL DEFAULT '', ` +
-          `local_path TEXT NOT NULL DEFAULT '', ` +
-          `install TEXT NOT NULL DEFAULT 'project', ` +
-          `source_sessions TEXT NOT NULL DEFAULT '[]', ` +
-          `source_agent TEXT NOT NULL DEFAULT '', ` +
-          `scope TEXT NOT NULL DEFAULT 'me', ` +
-          `author TEXT NOT NULL DEFAULT '', ` +
-          `description TEXT NOT NULL DEFAULT '', ` +
-          `trigger_text TEXT NOT NULL DEFAULT '', ` +
-          `body TEXT NOT NULL DEFAULT '', ` +
-          `version BIGINT NOT NULL DEFAULT 1, ` +
-          `created_at TEXT NOT NULL DEFAULT '', ` +
-          `updated_at TEXT NOT NULL DEFAULT ''` +
-        `) USING deeplake`,
-        safe,
-      );
+      await this.createTableWithRetry(buildCreateTableSql(safe, SKILLS_COLUMNS), safe);
       log(`table "${safe}" created`);
       if (!tables.includes(safe)) this._tablesCache = [...tables, safe];
     }
+    // Always heal — same rationale as ensureTable / ensureSessionsTable.
+    await this.healSchema(safe, SKILLS_COLUMNS);
     await this.ensureLookupIndex(safe, "project_key_name", `("project_key", "name")`);
   }
+
+  /**
+   * Create the rules table.
+   *
+   * One row per rule version (same write pattern as skills): edits INSERT
+   * a fresh row with version+1, reads pick latest per rule_id via
+   * `ORDER BY version DESC LIMIT 1`. Sidesteps the Deeplake
+   * UPDATE-coalescing quirk by never UPDATEing.
+   */
+  async ensureRulesTable(name: string): Promise<void> {
+    // `name` ultimately comes from HIVEMIND_RULES_TABLE — sqlIdent rejects
+    // anything outside [A-Za-z_][A-Za-z0-9_]* to keep the CREATE/ALTER
+    // path injection-free.
+    const safe = sqlIdent(name);
+    const tables = await this.listTables();
+    if (!tables.includes(safe)) {
+      log(`table "${safe}" not found, creating`);
+      await this.createTableWithRetry(buildCreateTableSql(safe, RULES_COLUMNS), safe);
+      log(`table "${safe}" created`);
+      if (!tables.includes(safe)) this._tablesCache = [...tables, safe];
+    }
+    await this.healSchema(safe, RULES_COLUMNS);
+    // Latest-row lookup index — matches the SKILLS table's (project_key,
+    // name) pattern. The (rule_id, version) tuple is what `read.ts` will
+    // scan with ORDER BY version DESC LIMIT 1.
+    await this.ensureLookupIndex(safe, "rule_id_version", `("rule_id", "version")`);
+  }
+
+  /**
+   * Create the goals table.
+   *
+   * Backed by the VFS path convention memory/goal/<owner>/<status>/<goal_id>.md.
+   * INSERT-only version-bumped: rm and mv operations translate to fresh
+   * v=N+1 rows (status flips for mv → closed; rm is the same soft-close).
+   * The (goal_id, version) index lets the VFS dispatch a cheap latest-row
+   * read on cat / Read of a single goal.
+   */
+  async ensureGoalsTable(name: string): Promise<void> {
+    const safe = sqlIdent(name);
+    const tables = await this.listTables();
+    if (!tables.includes(safe)) {
+      log(`table "${safe}" not found, creating`);
+      await this.createTableWithRetry(buildCreateTableSql(safe, GOALS_COLUMNS), safe);
+      log(`table "${safe}" created`);
+      if (!tables.includes(safe)) this._tablesCache = [...tables, safe];
+    }
+    await this.healSchema(safe, GOALS_COLUMNS);
+    await this.ensureLookupIndex(safe, "goal_id_version", `("goal_id", "version")`);
+    // Secondary index: SessionStart banner filters by owner+status, so
+    // the (owner, status) pair lookup is the hot path.
+    await this.ensureLookupIndex(safe, "owner_status", `("owner", "status")`);
+  }
+
+  /**
+   * Create the docs table — per-file documentation kept fresh on code deltas.
+   *
+   * INSERT-only version-bumped (same write pattern as rules/skills): every
+   * edit appends a fresh row with version+1, reads pick the latest per
+   * doc_id via `ORDER BY version DESC LIMIT 1` (see src/docs/read.ts).
+   * Sidesteps the Deeplake UPDATE-coalescing quirk by never UPDATEing.
+   * The (doc_id, version) index is what the latest-row read scans.
+   */
+  async ensureDocsTable(name: string): Promise<void> {
+    const safe = sqlIdent(name);
+    const tables = await this.listTables();
+    if (!tables.includes(safe)) {
+      log(`table "${safe}" not found, creating`);
+      await this.createTableWithRetry(buildCreateTableSql(safe, DOCS_COLUMNS), safe);
+      log(`table "${safe}" created`);
+      if (!tables.includes(safe)) this._tablesCache = [...tables, safe];
+    }
+    await this.healSchema(safe, DOCS_COLUMNS);
+    await this.ensureLookupIndex(safe, "doc_id_version", `("doc_id", "version")`);
+  }
 }
+
+// ── Test helpers ────────────────────────────────────────────────────────────
+
+/** Reset module-local flags so tests start clean. Not for production use. */
+export function _resetSdkStateForTesting(): void {
+  _signalledBalanceExhausted = false;
+}
+
